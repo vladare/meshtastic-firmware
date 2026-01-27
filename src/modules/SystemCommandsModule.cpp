@@ -13,6 +13,9 @@
 #include "Module.h"
 #include "NodeDB.h"
 #include "main.h"
+#include "mesh/Router.h"
+#include "mesh/generated/meshtastic/mesh.pb.h"
+#include "mesh/generated/meshtastic/portnums.pb.h"
 #include "modules/AdminModule.h"
 #include "modules/ExternalNotificationModule.h"
 
@@ -115,6 +118,26 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
     case INPUT_BROKER_SHUTDOWN:
         shutdownAtMsec = millis();
         return true;
+
+    // SOS (T1000-E and any board that maps long-press to INPUT_BROKER_SOS)
+    case INPUT_BROKER_SOS: {
+        meshtastic_MeshPacket *p = router->allocForSending();
+        if (p) {
+            p->decoded.portnum = meshtastic_PortNum_ALERT_APP;
+            p->priority = meshtastic_MeshPacket_Priority_ALERT;
+            static const char sosPayload[] = "SOS";
+            memcpy(p->decoded.payload.bytes, sosPayload, sizeof(sosPayload) - 1);
+            p->decoded.payload.size = sizeof(sosPayload) - 1;
+            meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeDB->getNodeNum());
+            if (node) {
+                p->channel = node->channel;
+            }
+            service->sendToMesh(p, RX_SRC_LOCAL);
+            IF_SCREEN(screen->showSimpleBanner("SOS Sent", 3000));
+            LOG_INFO("SOS sent to mesh");
+        }
+        return true;
+    }
 
     default:
         // No other input events handled here

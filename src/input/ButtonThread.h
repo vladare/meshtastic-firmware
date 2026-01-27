@@ -43,7 +43,10 @@ struct ButtonConfig {
 #endif
 
 #ifndef BUTTON_LEADUP_MS
-#define BUTTON_LEADUP_MS 2200 // Play lead-up sound after 2.5 seconds of holding
+#define BUTTON_LEADUP_MS 2200 // Play lead-up sound after 2.2 seconds of holding
+#endif
+#if defined(TRACKER_T1000_E)
+#define BUTTON_LEADUP_MS_T1000E 3500 // T1000-E: lead-up between SOS (2s) and shutdown (5s)
 #endif
 
 class ButtonThread : public Observable<const InputEvent *>, public concurrency::OSThread

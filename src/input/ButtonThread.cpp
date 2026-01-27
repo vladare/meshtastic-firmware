@@ -145,7 +145,14 @@ int32_t ButtonThread::runOnce()
     }
 
     // Progressive lead-up sound system
-    if (!_suppressLeadUp && buttonCurrentlyPressed && (millis() - buttonPressStartTime) >= BUTTON_LEADUP_MS) {
+    if (!_suppressLeadUp && buttonCurrentlyPressed &&
+        (millis() - buttonPressStartTime) >=
+#if defined(TRACKER_T1000_E)
+            BUTTON_LEADUP_MS_T1000E
+#else
+            BUTTON_LEADUP_MS
+#endif
+    ) {
 
         // Start the progressive sequence if not already active
         if (!leadUpSequenceActive) {
