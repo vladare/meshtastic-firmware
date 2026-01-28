@@ -109,6 +109,22 @@ static bool isSosAlert(const meshtastic_MeshPacket &mp)
     return false;
 }
 
+static bool isSosAckDmToUs(const meshtastic_MeshPacket &mp)
+{
+    if (mp.which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
+        return false;
+    }
+    if (!isToUs(&mp) || isBroadcast(mp.to)) {
+        return false;
+    }
+    if (mp.decoded.portnum != meshtastic_PortNum_TEXT_MESSAGE_APP) {
+        return false;
+    }
+    const auto &pl = mp.decoded.payload;
+    return (pl.size == 7 && pl.bytes[0] == 'S' && pl.bytes[1] == 'O' && pl.bytes[2] == 'S' && pl.bytes[3] == '-' &&
+            pl.bytes[4] == 'A' && pl.bytes[5] == 'C' && pl.bytes[6] == 'K');
+}
+
 // Type of sound to replay during nag cycle; runOnce() uses this so SOS replays SOS_RINGTONE, not generic ringtone.
 enum NagSoundType { NAG_SOUND_NORMAL = 0, NAG_SOUND_SOS = 1 };
 static uint8_t currentNagSound = NAG_SOUND_NORMAL;
@@ -603,6 +619,11 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
             }
 
             if (moduleConfig.external_notification.alert_message_buzzer && !is_muted) {
+                // SOS-ACK DM is handled by TextMessageModule with a distinct chirp; suppress generic message beep here.
+                if (isSosAckDmToUs(mp)) {
+                    setIntervalFromNow(0);
+                    return ProcessMessage::CONTINUE;
+                }
                 const bool buzzerAllowed = (config.device.buzzer_mode != meshtastic_Config_DeviceConfig_BuzzerMode_DIRECT_MSG_ONLY ||
                                            (!isBroadcast(mp.to) && isToUs(&mp)));
                 if (buzzerAllowed) {
