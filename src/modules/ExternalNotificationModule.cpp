@@ -78,9 +78,13 @@ bool ascending = true;
 // Used when the packet is classified as SOS (ALERT_APP "SOS" or TEXT_MESSAGE_APP "SOS: ...").
 static const char SOS_RINGTONE[] = "SOS:d=4,o=5,b=180:c6,g5,c6,g5,c6,g5,c6,g5,c6";
 
-// TEST interval: repeat the SOS alarm every 2 minutes until locally acknowledged.
-// (Easy to switch to 15 minutes later.)
-static const uint32_t SOS_REPEAT_MS = 2 * 60 * 1000;
+// SOS repeating schedule:
+// - Phase 1 (first 15 minutes): repeat every 5 minutes, max 3 repeats.
+// - Phase 2 (after 15 minutes OR after 3 repeats): repeat every 15 minutes.
+static const uint32_t SOS_FAST_PHASE_MS = 15 * 60 * 1000;
+static const uint32_t SOS_FAST_REPEAT_MS = 5 * 60 * 1000;
+static const uint32_t SOS_SLOW_REPEAT_MS = 15 * 60 * 1000;
+static const uint8_t SOS_FAST_REPEAT_MAX = 3;
 // Deduplicate the 2-packet SOS gesture (ALERT + TEXT) so we don't start twice.
 static const uint32_t SOS_START_DEDUP_MS = 10 * 1000;
 
@@ -139,6 +143,8 @@ static uint8_t currentNagSound = NAG_SOUND_NORMAL;
 static bool sosActive = false;
 static NodeNum sosFrom = 0;
 static uint32_t nextRepeatAtMs = 0;
+static uint32_t sosStartAtMs = 0;
+static uint8_t sosRepeatCount = 0;
 static uint32_t lastSosStartAtMs = 0;
 
 meshtastic_RTTTLConfig rtttlConfig;
@@ -178,11 +184,6 @@ int32_t ExternalNotificationModule::runOnce()
         const bool sosSoundingNow = (isNagging && currentNagSound == NAG_SOUND_SOS && nagCycleCutoff != UINT32_MAX &&
                                      (int32_t)(nagCycleCutoff - now) > 0);
         if (sosActive && nextRepeatAtMs != 0 && (int32_t)(now - nextRepeatAtMs) >= 0 && !sosSoundingNow) {
-            // Catch up in case of long sleeps.
-            while (sosActive && nextRepeatAtMs != 0 && (int32_t)(now - nextRepeatAtMs) >= 0) {
-                nextRepeatAtMs += SOS_REPEAT_MS;
-            }
-
             // Replay the same SOS alarm now.
             isNagging = true;
             currentNagSound = NAG_SOUND_SOS;
@@ -212,6 +213,17 @@ int32_t ExternalNotificationModule::runOnce()
             }
 
             setIntervalFromNow(0);
+
+            // Count repeats (does not include the initial alarm on detection).
+            if (sosRepeatCount < 0xFF) {
+                sosRepeatCount++;
+            }
+            if (sosActive && sosStartAtMs == 0) {
+                sosStartAtMs = now;
+            }
+            const uint32_t elapsed = now - sosStartAtMs;
+            const bool useFastNext = (elapsed < SOS_FAST_PHASE_MS) && (sosRepeatCount < SOS_FAST_REPEAT_MAX);
+            nextRepeatAtMs = now + (useFastNext ? SOS_FAST_REPEAT_MS : SOS_SLOW_REPEAT_MS);
         }
 
         // If the output is turned on, turn it back off after the given period of time.
@@ -466,6 +478,8 @@ void ExternalNotificationModule::stopNow()
         sosActive = false;
         sosFrom = 0;
         nextRepeatAtMs = 0;
+        sosStartAtMs = 0;
+        sosRepeatCount = 0;
         lastSosStartAtMs = 0;
     }
 
@@ -724,7 +738,9 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                             sosActive = true;
                             sosFrom = mp.from;
                             lastSosStartAtMs = now;
-                            nextRepeatAtMs = now + SOS_REPEAT_MS;
+                            sosStartAtMs = now;
+                            sosRepeatCount = 0;
+                            nextRepeatAtMs = now + SOS_FAST_REPEAT_MS;
                         }
                         if (dup) {
                             // Keep existing alarm playing, but don't start a second time.
