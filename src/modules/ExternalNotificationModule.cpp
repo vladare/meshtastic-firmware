@@ -21,6 +21,7 @@
 #include "buzz/buzz.h"
 #include "configuration.h"
 #include "main.h"
+#include "mesh/generated/meshtastic/mesh.pb.h"
 #include "mesh/generated/meshtastic/rtttl.pb.h"
 #include <Arduino.h>
 
@@ -72,6 +73,41 @@ bool ascending = true;
 #define EXT_NOTIFICATION_FAST_THREAD_MS 25
 
 #define ASCII_BELL 0x07
+
+// Distinct SOS sound: three-note repeating alarm pattern, clearly different from generic message ringtone.
+// Used when the packet is classified as SOS (ALERT_APP "SOS" or TEXT_MESSAGE_APP "SOS: ...").
+static const char SOS_RINGTONE[] = "SOS:d=4,o=5,b=180:c6,g5,c6,g5,c6,g5,c6,g5,c6";
+
+/**
+ * @brief Returns true iff the packet is an SOS alert for notification sound purposes.
+ * Covers: (A) ALERT_APP with exact payload "SOS" (3 bytes), and
+ *         (B) TEXT_MESSAGE_APP with payload starting with "SOS:" (e.g. "SOS: I need help. No GPS fix.").
+ * Used to route receive-side notifications to the distinct SOS sound; non-SOS messages use the generic beep.
+ */
+static bool isSosAlert(const meshtastic_MeshPacket &mp)
+{
+    if (mp.which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
+        return false;
+    }
+    const auto &pl = mp.decoded.payload;
+
+    // Case A: ALERT_APP "SOS"
+    if (mp.decoded.portnum == meshtastic_PortNum_ALERT_APP) {
+        if (pl.size == 3 && pl.bytes[0] == 'S' && pl.bytes[1] == 'O' && pl.bytes[2] == 'S') {
+            return true;
+        }
+        return false;
+    }
+
+    // Case B: TEXT_MESSAGE_APP "SOS: ..."
+    if (mp.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
+        if (pl.size >= 4 && pl.bytes[0] == 'S' && pl.bytes[1] == 'O' && pl.bytes[2] == 'S' && pl.bytes[3] == ':') {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 meshtastic_RTTTLConfig rtttlConfig;
 
@@ -542,40 +578,71 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
             }
 
             if (moduleConfig.external_notification.alert_message_buzzer && !is_muted) {
-                LOG_INFO("externalNotificationModule - Notification Module (Buzzer)");
-                if (config.device.buzzer_mode != meshtastic_Config_DeviceConfig_BuzzerMode_DIRECT_MSG_ONLY ||
-                    (!isBroadcast(mp.to) && isToUs(&mp))) {
-                    // Buzz if buzzer mode is not in DIRECT_MSG_ONLY or is DM to us
+                const bool buzzerAllowed = (config.device.buzzer_mode != meshtastic_Config_DeviceConfig_BuzzerMode_DIRECT_MSG_ONLY ||
+                                           (!isBroadcast(mp.to) && isToUs(&mp)));
+                if (buzzerAllowed) {
                     isNagging = true;
-#ifdef T_LORA_PAGER
-                    if (canBuzz()) {
-                        drv.setWaveform(0, 16); // Long buzzer 100%
-                        drv.setWaveform(1, 0);  // Pause
-                        drv.setWaveform(2, 16);
-                        drv.setWaveform(3, 0);
-                        drv.setWaveform(4, 16);
-                        drv.setWaveform(5, 0);
-                        drv.setWaveform(6, 16);
-                        drv.setWaveform(7, 0);
-                        drv.go();
-                    }
-#endif
-                    if (!moduleConfig.external_notification.use_pwm && !moduleConfig.external_notification.use_i2s_as_buzzer) {
-                        setExternalState(2, true);
-                    } else {
+                    const bool sos = isSosAlert(mp);
+
+                    if (sos && canBuzz()) {
+                        // SOS path: distinct pattern; do not play generic message beep for this packet.
+                        LOG_INFO("externalNotificationModule - SOS Alert (Buzzer)");
+                        if (!moduleConfig.external_notification.use_pwm && !moduleConfig.external_notification.use_i2s_as_buzzer) {
+                            setExternalState(2, true);
+                            if (moduleConfig.external_notification.nag_timeout) {
+                                nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
+                            } else {
+                                uint32_t ms = moduleConfig.external_notification.output_ms ? moduleConfig.external_notification.output_ms * 3 : 3000;
+                                nagCycleCutoff = millis() + ms;
+                            }
+                        } else {
 #ifdef HAS_I2S
-                        if (moduleConfig.external_notification.use_i2s_as_buzzer) {
-                            audioThread->beginRttl(rtttlConfig.ringtone, strlen_P(rtttlConfig.ringtone));
-                        } else
+                            if (moduleConfig.external_notification.use_i2s_as_buzzer) {
+                                audioThread->beginRttl(SOS_RINGTONE, strlen(SOS_RINGTONE));
+                            } else
 #endif
-                            if (moduleConfig.external_notification.use_pwm) {
-                            rtttl::begin(config.device.buzzer_gpio, rtttlConfig.ringtone);
+                                if (moduleConfig.external_notification.use_pwm) {
+                                rtttl::begin(config.device.buzzer_gpio, SOS_RINGTONE);
+                            }
+                            if (moduleConfig.external_notification.nag_timeout) {
+                                nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
+                            } else {
+                                nagCycleCutoff = millis() + moduleConfig.external_notification.output_ms;
+                            }
                         }
-                    }
-                    if (moduleConfig.external_notification.nag_timeout) {
-                        nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
-                    } else {
-                        nagCycleCutoff = millis() + moduleConfig.external_notification.output_ms;
+                    } else if (!sos) {
+                        // Normal message path: existing generic beep/ringtone. BEL path unchanged above.
+                        LOG_INFO("externalNotificationModule - Notification Module (Buzzer)");
+#ifdef T_LORA_PAGER
+                        if (canBuzz()) {
+                            drv.setWaveform(0, 16); // Long buzzer 100%
+                            drv.setWaveform(1, 0);  // Pause
+                            drv.setWaveform(2, 16);
+                            drv.setWaveform(3, 0);
+                            drv.setWaveform(4, 16);
+                            drv.setWaveform(5, 0);
+                            drv.setWaveform(6, 16);
+                            drv.setWaveform(7, 0);
+                            drv.go();
+                        }
+#endif
+                        if (!moduleConfig.external_notification.use_pwm && !moduleConfig.external_notification.use_i2s_as_buzzer) {
+                            setExternalState(2, true);
+                        } else {
+#ifdef HAS_I2S
+                            if (moduleConfig.external_notification.use_i2s_as_buzzer) {
+                                audioThread->beginRttl(rtttlConfig.ringtone, strlen_P(rtttlConfig.ringtone));
+                            } else
+#endif
+                                if (moduleConfig.external_notification.use_pwm) {
+                                rtttl::begin(config.device.buzzer_gpio, rtttlConfig.ringtone);
+                            }
+                        }
+                        if (moduleConfig.external_notification.nag_timeout) {
+                            nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
+                        } else {
+                            nagCycleCutoff = millis() + moduleConfig.external_notification.output_ms;
+                        }
                     }
                 } else {
                     // Don't beep if buzzer mode is "direct messages only" and it is no direct message
