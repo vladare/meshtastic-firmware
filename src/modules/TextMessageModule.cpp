@@ -62,7 +62,7 @@ static void maybeSendSosAck(const meshtastic_MeshPacket &mp)
         return;
     }
 
-    ack->to = mp.from;
+    ack->to = NODENUM_BROADCAST;
     ack->channel = mp.channel; // critical: keep same channel so sender can decrypt/show it
     ack->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
 

@@ -479,8 +479,16 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
                     LOG_ERROR("Invalid portnum (bad psk?)!");
 #if !(MESHTASTIC_EXCLUDE_PKI)
                 } else if (!owner.is_licensed && isToUs(p) && decodedtmp.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
-                    LOG_WARN("Rejecting legacy DM");
-                    return DecodeState::DECODE_FAILURE;
+                    const auto &pl = decodedtmp.payload;
+                    const bool isSosAck =
+                        (pl.size == 7 &&
+                         pl.bytes[0] == 'S' && pl.bytes[1] == 'O' && pl.bytes[2] == 'S' &&
+                         pl.bytes[3] == '-' &&
+                         pl.bytes[4] == 'A' && pl.bytes[5] == 'C' && pl.bytes[6] == 'K');
+                    if (!isSosAck) {
+                        LOG_WARN("Rejecting legacy DM");
+                        return DecodeState::DECODE_FAILURE;
+                    }
 #endif
                 } else {
                     p->decoded = decodedtmp;
