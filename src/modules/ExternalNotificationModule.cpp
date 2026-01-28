@@ -109,6 +109,10 @@ static bool isSosAlert(const meshtastic_MeshPacket &mp)
     return false;
 }
 
+// Type of sound to replay during nag cycle; runOnce() uses this so SOS replays SOS_RINGTONE, not generic ringtone.
+enum NagSoundType { NAG_SOUND_NORMAL = 0, NAG_SOUND_SOS = 1 };
+static uint8_t currentNagSound = NAG_SOUND_NORMAL;
+
 meshtastic_RTTTLConfig rtttlConfig;
 
 ExternalNotificationModule *externalNotificationModule;
@@ -215,7 +219,12 @@ int32_t ExternalNotificationModule::runOnce()
             if (audioThread->isPlaying()) {
                 // Continue playing
             } else if (isNagging && (nagCycleCutoff >= millis())) {
-                audioThread->beginRttl(rtttlConfig.ringtone, strlen_P(rtttlConfig.ringtone));
+                // Replay using same sound type as initial trigger (SOS vs normal), so SOS never falls back to generic.
+                if (currentNagSound == NAG_SOUND_SOS) {
+                    audioThread->beginRttl(SOS_RINGTONE, strlen(SOS_RINGTONE));
+                } else {
+                    audioThread->beginRttl(rtttlConfig.ringtone, strlen_P(rtttlConfig.ringtone));
+                }
             }
             // we need fast updates to play the RTTTL
             delay = EXT_NOTIFICATION_FAST_THREAD_MS;
@@ -226,8 +235,12 @@ int32_t ExternalNotificationModule::runOnce()
             if (rtttl::isPlaying()) {
                 rtttl::play();
             } else if (isNagging && (nagCycleCutoff >= millis())) {
-                // start the song again if we have time left
-                rtttl::begin(config.device.buzzer_gpio, rtttlConfig.ringtone);
+                // Replay using same sound type as initial trigger (SOS vs normal), so SOS never falls back to generic.
+                if (currentNagSound == NAG_SOUND_SOS) {
+                    rtttl::begin(config.device.buzzer_gpio, SOS_RINGTONE);
+                } else {
+                    rtttl::begin(config.device.buzzer_gpio, rtttlConfig.ringtone);
+                }
             }
             // we need fast updates to play the RTTTL
             delay = EXT_NOTIFICATION_FAST_THREAD_MS;
@@ -362,6 +375,7 @@ void ExternalNotificationModule::stopNow()
     // Prevent the state machine from immediately re-triggering outputs after a manual stop.
     isNagging = false;
     nagCycleCutoff = UINT32_MAX;
+    currentNagSound = NAG_SOUND_NORMAL;
 
 #ifdef HAS_I2S
     // GPIO0 is used as mclk for I2S audio and set to OUTPUT by the sound library
@@ -509,6 +523,7 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                 if (containsBell) {
                     LOG_INFO("externalNotificationModule - Notification Bell");
                     isNagging = true;
+                    currentNagSound = NAG_SOUND_NORMAL;
                     setExternalState(0, true);
                     if (moduleConfig.external_notification.nag_timeout) {
                         nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
@@ -522,6 +537,7 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                 if (containsBell) {
                     LOG_INFO("externalNotificationModule - Notification Bell (Vibra)");
                     isNagging = true;
+                    currentNagSound = NAG_SOUND_NORMAL;
                     setExternalState(1, true);
                     if (moduleConfig.external_notification.nag_timeout) {
                         nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
@@ -535,6 +551,7 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                 if (containsBell) {
                     LOG_INFO("externalNotificationModule - Notification Bell (Buzzer)");
                     isNagging = true;
+                    currentNagSound = NAG_SOUND_NORMAL;
                     if (!moduleConfig.external_notification.use_pwm && !moduleConfig.external_notification.use_i2s_as_buzzer) {
                         setExternalState(2, true);
                     } else {
@@ -558,6 +575,7 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
             if (moduleConfig.external_notification.alert_message && !is_muted) {
                 LOG_INFO("externalNotificationModule - Notification Module");
                 isNagging = true;
+                currentNagSound = NAG_SOUND_NORMAL;
                 setExternalState(0, true);
                 if (moduleConfig.external_notification.nag_timeout) {
                     nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
@@ -569,6 +587,7 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
             if (moduleConfig.external_notification.alert_message_vibra && !is_muted) {
                 LOG_INFO("externalNotificationModule - Notification Module (Vibra)");
                 isNagging = true;
+                currentNagSound = NAG_SOUND_NORMAL;
                 setExternalState(1, true);
                 if (moduleConfig.external_notification.nag_timeout) {
                     nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
@@ -583,6 +602,7 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                 if (buzzerAllowed) {
                     isNagging = true;
                     const bool sos = isSosAlert(mp);
+                    currentNagSound = sos ? NAG_SOUND_SOS : NAG_SOUND_NORMAL; // set for entire nag cycle, even when !canBuzz()
 
                     if (sos && canBuzz()) {
                         // SOS path: distinct pattern; do not play generic message beep for this packet.
@@ -607,7 +627,8 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                             if (moduleConfig.external_notification.nag_timeout) {
                                 nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
                             } else {
-                                nagCycleCutoff = millis() + moduleConfig.external_notification.output_ms;
+                                uint32_t ms = moduleConfig.external_notification.output_ms ? moduleConfig.external_notification.output_ms * 3 : 3000;
+                                nagCycleCutoff = millis() + ms;
                             }
                         }
                     } else if (!sos) {
@@ -642,6 +663,14 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                             nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
                         } else {
                             nagCycleCutoff = millis() + moduleConfig.external_notification.output_ms;
+                        }
+                    } else {
+                        // sos && !canBuzz(): we set isNagging and currentNagSound but don't play; use same SOS duration as other SOS paths
+                        if (moduleConfig.external_notification.nag_timeout) {
+                            nagCycleCutoff = millis() + moduleConfig.external_notification.nag_timeout * 1000;
+                        } else {
+                            uint32_t ms = moduleConfig.external_notification.output_ms ? moduleConfig.external_notification.output_ms * 3 : 3000;
+                            nagCycleCutoff = millis() + ms;
                         }
                     }
                 } else {
