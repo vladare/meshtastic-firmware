@@ -78,6 +78,12 @@ bool ascending = true;
 // Used when the packet is classified as SOS (ALERT_APP "SOS" or TEXT_MESSAGE_APP "SOS: ...").
 static const char SOS_RINGTONE[] = "SOS:d=4,o=5,b=180:c6,g5,c6,g5,c6,g5,c6,g5,c6";
 
+// TEST interval: repeat the SOS alarm every 2 minutes until locally acknowledged.
+// (Easy to switch to 15 minutes later.)
+static const uint32_t SOS_REPEAT_MS = 2 * 60 * 1000;
+// Deduplicate the 2-packet SOS gesture (ALERT + TEXT) so we don't start twice.
+static const uint32_t SOS_START_DEDUP_MS = 10 * 1000;
+
 /**
  * @brief Returns true iff the packet is an SOS alert for notification sound purposes.
  * Covers: (A) ALERT_APP with exact payload "SOS" (3 bytes), and
@@ -129,6 +135,12 @@ static bool isSosAckDmToUs(const meshtastic_MeshPacket &mp)
 enum NagSoundType { NAG_SOUND_NORMAL = 0, NAG_SOUND_SOS = 1 };
 static uint8_t currentNagSound = NAG_SOUND_NORMAL;
 
+// Receiver-side SOS repeating state (local device).
+static bool sosActive = false;
+static NodeNum sosFrom = 0;
+static uint32_t nextRepeatAtMs = 0;
+static uint32_t lastSosStartAtMs = 0;
+
 meshtastic_RTTTLConfig rtttlConfig;
 
 ExternalNotificationModule *externalNotificationModule;
@@ -150,26 +162,70 @@ int32_t ExternalNotificationModule::runOnce()
         // audioThread->isPlaying() also handles actually playing the RTTTL, needs to be called in loop
         isRtttlPlaying = isRtttlPlaying || audioThread->isPlaying();
 #endif
-        if ((nagCycleCutoff < millis()) && !isRtttlPlaying) {
+        const uint32_t now = millis();
+
+        if ((nagCycleCutoff < now) && !isRtttlPlaying) {
             // Turn off external notification immediately when timeout is reached, regardless of song state
             nagCycleCutoff = UINT32_MAX;
             ExternalNotificationModule::stopNow();
             isNagging = false;
-            return INT32_MAX; // save cycles till we're needed again
+            if (!sosActive) {
+                return INT32_MAX; // save cycles till we're needed again
+            }
+        }
+
+        // Repeat SOS alarm while active, regardless of other incoming packets.
+        const bool sosSoundingNow = (isNagging && currentNagSound == NAG_SOUND_SOS && nagCycleCutoff != UINT32_MAX &&
+                                     (int32_t)(nagCycleCutoff - now) > 0);
+        if (sosActive && nextRepeatAtMs != 0 && (int32_t)(now - nextRepeatAtMs) >= 0 && !sosSoundingNow) {
+            // Catch up in case of long sleeps.
+            while (sosActive && nextRepeatAtMs != 0 && (int32_t)(now - nextRepeatAtMs) >= 0) {
+                nextRepeatAtMs += SOS_REPEAT_MS;
+            }
+
+            // Replay the same SOS alarm now.
+            isNagging = true;
+            currentNagSound = NAG_SOUND_SOS;
+
+            if (canBuzz()) {
+                if (!moduleConfig.external_notification.use_pwm && !moduleConfig.external_notification.use_i2s_as_buzzer) {
+                    setExternalState(2, true);
+                } else {
+#ifdef HAS_I2S
+                    if (moduleConfig.external_notification.use_i2s_as_buzzer) {
+                        if (audioThread) {
+                            audioThread->beginRttl(SOS_RINGTONE, strlen(SOS_RINGTONE));
+                        }
+                    } else
+#endif
+                        if (moduleConfig.external_notification.use_pwm) {
+                        rtttl::begin(config.device.buzzer_gpio, SOS_RINGTONE);
+                    }
+                }
+            }
+
+            if (moduleConfig.external_notification.nag_timeout) {
+                nagCycleCutoff = now + moduleConfig.external_notification.nag_timeout * 1000;
+            } else {
+                uint32_t ms = moduleConfig.external_notification.output_ms ? moduleConfig.external_notification.output_ms * 3 : 3000;
+                nagCycleCutoff = now + ms;
+            }
+
+            setIntervalFromNow(0);
         }
 
         // If the output is turned on, turn it back off after the given period of time.
         if (isNagging) {
             delay = (moduleConfig.external_notification.output_ms ? moduleConfig.external_notification.output_ms
                                                                   : EXT_NOTIFICATION_MODULE_OUTPUT_MS);
-            if (externalTurnedOn[0] + delay < millis()) {
+            if (externalTurnedOn[0] + delay < now) {
                 setExternalState(0, !getExternal(0));
             }
-            if (externalTurnedOn[1] + delay < millis()) {
+            if (externalTurnedOn[1] + delay < now) {
                 setExternalState(1, !getExternal(1));
             }
             // Only toggle buzzer output if not using PWM mode (to avoid conflict with RTTTL)
-            if (!moduleConfig.external_notification.use_pwm && externalTurnedOn[2] + delay < millis()) {
+            if (!moduleConfig.external_notification.use_pwm && externalTurnedOn[2] + delay < now) {
                 LOG_DEBUG("EXTERNAL 2 %d compared to %d", externalTurnedOn[2] + moduleConfig.external_notification.output_ms,
                           millis());
                 setExternalState(2, !getExternal(2));
@@ -260,6 +316,15 @@ int32_t ExternalNotificationModule::runOnce()
             }
             // we need fast updates to play the RTTTL
             delay = EXT_NOTIFICATION_FAST_THREAD_MS;
+        }
+
+        // If SOS repeating is active, ensure we wake up for the next repeat.
+        if (sosActive && nextRepeatAtMs != 0) {
+            int32_t untilRepeatMs = (int32_t)(nextRepeatAtMs - millis());
+            if (untilRepeatMs < 0) {
+                untilRepeatMs = 0;
+            }
+            delay = min(delay, (uint32_t)untilRepeatMs);
         }
 
         return delay;
@@ -516,6 +581,15 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
         drv.go();
 #endif
         if (!isFromUs(&mp)) {
+            const bool sosPacket = isSosAlert(mp);
+            // While SOS alarm is sounding, do not let unrelated packets interfere with the active alarm.
+            if ((isNagging && currentNagSound == NAG_SOUND_SOS && nagCycleCutoff != UINT32_MAX &&
+                 (int32_t)(nagCycleCutoff - millis()) > 0) &&
+                !sosPacket) {
+                setIntervalFromNow(0);
+                return ProcessMessage::CONTINUE;
+            }
+
             // Check if the message contains a bell character. Don't do this loop for every pin, just once.
             auto &p = mp.decoded;
             bool containsBell = false;
@@ -628,8 +702,25 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                                            (!isBroadcast(mp.to) && isToUs(&mp)));
                 if (buzzerAllowed) {
                     isNagging = true;
-                    const bool sos = isSosAlert(mp);
+                    const bool sos = sosPacket;
                     currentNagSound = sos ? NAG_SOUND_SOS : NAG_SOUND_NORMAL; // set for entire nag cycle, even when !canBuzz()
+
+                    // Start/refresh SOS repeating state on first SOS (dedup the 2-packet SOS gesture).
+                    if (sos) {
+                        const uint32_t now = millis();
+                        const bool dup = (sosActive && mp.from == sosFrom && (uint32_t)(now - lastSosStartAtMs) < SOS_START_DEDUP_MS);
+                        if (!dup) {
+                            sosActive = true;
+                            sosFrom = mp.from;
+                            lastSosStartAtMs = now;
+                            nextRepeatAtMs = now + SOS_REPEAT_MS;
+                        }
+                        if (dup) {
+                            // Keep existing alarm playing, but don't start a second time.
+                            setIntervalFromNow(0);
+                            return ProcessMessage::CONTINUE;
+                        }
+                    }
 
                     if (sos && canBuzz()) {
                         // SOS path: distinct pattern; do not play generic message beep for this packet.
@@ -776,6 +867,14 @@ void ExternalNotificationModule::handleSetRingtone(const char *from_msg)
 int ExternalNotificationModule::handleInputEvent(const InputEvent *event)
 {
     if (nagCycleCutoff != UINT32_MAX) {
+        // Local acknowledge for SOS repeating: button press DURING active SOS alarm stops repeats.
+        if (sosActive && isNagging && currentNagSound == NAG_SOUND_SOS && nagCycleCutoff != UINT32_MAX &&
+            (int32_t)(nagCycleCutoff - millis()) > 0) {
+            sosActive = false;
+            sosFrom = 0;
+            nextRepeatAtMs = 0;
+            lastSosStartAtMs = 0;
+        }
         stopNow();
         return 1;
     }
