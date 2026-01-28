@@ -140,10 +140,12 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
         }
 
         // 2) Send text chat message (TEXT_MESSAGE_APP) so it appears in the channel
+        //    Use same GPS check as PositionModule: hasLocalPositionSinceBoot() + valid node position
         if (node) {
+            bool hasPosition = nodeDB->hasLocalPositionSinceBoot() && nodeDB->hasValidPosition(node);
             char textBuf[200];
             size_t textLen;
-            if (nodeDB->hasValidPosition(node)) {
+            if (hasPosition) {
                 double lat = node->position.latitude_i * 1e-7;
                 double lon = node->position.longitude_i * 1e-7;
                 int n = snprintf(textBuf, sizeof(textBuf), "SOS: I need help. Location: %.5f, %.5f", lat, lon);
@@ -163,7 +165,7 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
                     service->sendToMesh(tp, RX_SRC_LOCAL);
                 }
             }
-            if (nodeDB->hasValidPosition(node)) {
+            if (hasPosition) {
                 service->trySendPosition(NODENUM_BROADCAST, true);
             }
         }

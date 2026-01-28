@@ -145,14 +145,7 @@ int32_t ButtonThread::runOnce()
     }
 
     // Progressive lead-up sound system
-    if (!_suppressLeadUp && buttonCurrentlyPressed &&
-        (millis() - buttonPressStartTime) >=
-#if defined(TRACKER_T1000_E)
-            BUTTON_LEADUP_MS_T1000E
-#else
-            BUTTON_LEADUP_MS
-#endif
-    ) {
+    if (!_suppressLeadUp && buttonCurrentlyPressed && (millis() - buttonPressStartTime) >= BUTTON_LEADUP_MS) {
 
         // Start the progressive sequence if not already active
         if (!leadUpSequenceActive) {
@@ -217,11 +210,15 @@ int32_t ButtonThread::runOnce()
 
                 break;
             }
+#if !defined(TRACKER_T1000_E)
+            // On non-T1000-E, long action is emitted on LONG_PRESSED.
+            // T1000-E defers long vs long-long to LONG_RELEASED for mutually exclusive SOS vs shutdown.
             if (_longPress != INPUT_BROKER_NONE) {
                 // Forward long press to InputBroker (but NOT as DOWN/SELECT, just forward a "button long press" event)
                 evt.inputEvent = _longPress;
                 this->notifyObservers(&evt);
             }
+#endif
             // Reset combination tracking
             waitingForLongPress = false;
 
@@ -281,13 +278,26 @@ int32_t ButtonThread::runOnce()
             // Do actual shutdown when button released, otherwise the button release
         // may wake the board immediatedly.
         case BUTTON_EVENT_LONG_RELEASED: {
+            uint32_t duration = millis() - buttonPressStartTime;
+            LOG_INFO("LONG PRESS RELEASE AFTER %u MILLIS", duration);
 
-            LOG_INFO("LONG PRESS RELEASE AFTER %u MILLIS", millis() - buttonPressStartTime);
+#if defined(TRACKER_T1000_E)
+            // T1000-E: long and long-long are mutually exclusive, decided only on release by duration.
+            // [2000, 5000) ms → SOS only.  >= 5000 ms + lead-up → shutdown only.  No SOS on shutdown path.
+            if (duration >= _longLongPressTime && millis() > 30000 && _longLongPress != INPUT_BROKER_NONE && leadUpPlayed) {
+                evt.inputEvent = _longLongPress;
+                this->notifyObservers(&evt);
+            } else if (duration >= _longPressTime && _longPress != INPUT_BROKER_NONE) {
+                evt.inputEvent = _longPress;
+                this->notifyObservers(&evt);
+            }
+#else
             if (millis() > 30000 && _longLongPress != INPUT_BROKER_NONE &&
-                (millis() - buttonPressStartTime) >= _longLongPressTime && leadUpPlayed) {
+                duration >= _longLongPressTime && leadUpPlayed) {
                 evt.inputEvent = _longLongPress;
                 this->notifyObservers(&evt);
             }
+#endif
             // Reset combination tracking
             waitingForLongPress = false;
             leadUpPlayed = false;
