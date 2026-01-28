@@ -121,6 +121,9 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
 
     // SOS (T1000-E and any board that maps long-press to INPUT_BROKER_SOS)
     case INPUT_BROKER_SOS: {
+        meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeDB->getNodeNum());
+
+        // 1) Keep existing ALERT_APP send (popup + alarm)
         meshtastic_MeshPacket *p = router->allocForSending();
         if (p) {
             p->decoded.portnum = meshtastic_PortNum_ALERT_APP;
@@ -128,13 +131,41 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
             static const char sosPayload[] = "SOS";
             memcpy(p->decoded.payload.bytes, sosPayload, sizeof(sosPayload) - 1);
             p->decoded.payload.size = sizeof(sosPayload) - 1;
-            meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeDB->getNodeNum());
             if (node) {
                 p->channel = node->channel;
             }
             service->sendToMesh(p, RX_SRC_LOCAL);
             IF_SCREEN(screen->showSimpleBanner("SOS Sent", 3000));
             LOG_INFO("SOS sent to mesh");
+        }
+
+        // 2) Send text chat message (TEXT_MESSAGE_APP) so it appears in the channel
+        if (node) {
+            char textBuf[200];
+            size_t textLen;
+            if (nodeDB->hasValidPosition(node)) {
+                double lat = node->position.latitude_i * 1e-7;
+                double lon = node->position.longitude_i * 1e-7;
+                int n = snprintf(textBuf, sizeof(textBuf), "SOS: I need help. Location: %.5f, %.5f", lat, lon);
+                textLen = (n > 0 && (size_t)n < sizeof(textBuf)) ? (size_t)n : 0;
+            } else {
+                static const char noFix[] = "SOS: I need help. No GPS fix.";
+                textLen = sizeof(noFix) - 1;
+                memcpy(textBuf, noFix, textLen + 1);
+            }
+            if (textLen > 0) {
+                meshtastic_MeshPacket *tp = router->allocForSending();
+                if (tp && textLen <= sizeof(tp->decoded.payload.bytes)) {
+                    tp->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+                    tp->channel = node->channel;
+                    memcpy(tp->decoded.payload.bytes, textBuf, textLen);
+                    tp->decoded.payload.size = textLen;
+                    service->sendToMesh(tp, RX_SRC_LOCAL);
+                }
+            }
+            if (nodeDB->hasValidPosition(node)) {
+                service->trySendPosition(NODENUM_BROADCAST, true);
+            }
         }
         return true;
     }
