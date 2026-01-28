@@ -435,6 +435,9 @@ bool ExternalNotificationModule::nagging()
 
 void ExternalNotificationModule::stopNow()
 {
+    const bool wasSosNagging =
+        (sosActive && isNagging && currentNagSound == NAG_SOUND_SOS && nagCycleCutoff != UINT32_MAX);
+
     LOG_INFO("Turning off external notification: ");
     LOG_INFO("Stop RTTTL playback");
     rtttl::stop();
@@ -457,6 +460,14 @@ void ExternalNotificationModule::stopNow()
     isNagging = false;
     nagCycleCutoff = UINT32_MAX;
     currentNagSound = NAG_SOUND_NORMAL;
+
+    // If we just silenced an active SOS nag, fully cancel the repeat schedule too.
+    if (wasSosNagging) {
+        sosActive = false;
+        sosFrom = 0;
+        nextRepeatAtMs = 0;
+        lastSosStartAtMs = 0;
+    }
 
 #ifdef HAS_I2S
     // GPIO0 is used as mclk for I2S audio and set to OUTPUT by the sound library
