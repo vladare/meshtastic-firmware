@@ -278,22 +278,27 @@ int32_t ButtonThread::runOnce()
             // Do actual shutdown when button released, otherwise the button release
         // may wake the board immediatedly.
         case BUTTON_EVENT_LONG_RELEASED: {
-            uint32_t duration = millis() - buttonPressStartTime;
-            LOG_INFO("LONG PRESS RELEASE AFTER %u MILLIS", duration);
+            uint32_t durationMs = (uint32_t)(millis() - buttonPressStartTime);
+            uint32_t longMs = (uint32_t)_longPressTime;
+            uint32_t longLongMs = (uint32_t)_longLongPressTime;
+            LOG_INFO("LONG PRESS RELEASE AFTER %lu MS (long=%lu longLong=%lu)", (unsigned long)durationMs, (unsigned long)longMs,
+                     (unsigned long)longLongMs);
 
 #if defined(TRACKER_T1000_E)
             // T1000-E: long and long-long are mutually exclusive, decided only on release by duration.
-            // [2000, 5000) ms → SOS only.  >= 5000 ms + lead-up → shutdown only.  No SOS on shutdown path.
-            if (duration >= _longLongPressTime && millis() > 30000 && _longLongPress != INPUT_BROKER_NONE && leadUpPlayed) {
+            // Shutdown only when duration >= longLongMs and lead-up done. Otherwise SOS when duration >= longMs.
+            if (longLongMs > 0 && durationMs >= longLongMs && millis() > 30000 && _longLongPress != INPUT_BROKER_NONE &&
+                leadUpPlayed) {
                 evt.inputEvent = _longLongPress;
                 this->notifyObservers(&evt);
-            } else if (duration >= _longPressTime && _longPress != INPUT_BROKER_NONE) {
+            } else if (longMs > 0 && durationMs >= longMs && _longPress != INPUT_BROKER_NONE) {
                 evt.inputEvent = _longPress;
                 this->notifyObservers(&evt);
+                LOG_DEBUG("T1000-E: SOS sent on release (duration %lu ms)", (unsigned long)durationMs);
             }
 #else
             if (millis() > 30000 && _longLongPress != INPUT_BROKER_NONE &&
-                duration >= _longLongPressTime && leadUpPlayed) {
+                durationMs >= longLongMs && leadUpPlayed) {
                 evt.inputEvent = _longLongPress;
                 this->notifyObservers(&evt);
             }
