@@ -113,38 +113,6 @@ static bool isSosAlert(const meshtastic_MeshPacket &mp)
 enum NagSoundType { NAG_SOUND_NORMAL = 0, NAG_SOUND_SOS = 1 };
 static uint8_t currentNagSound = NAG_SOUND_NORMAL;
 
-// SOS auto-ack (receiver side): deduplicate because one SOS gesture sends 2 packets (ALERT_APP "SOS" + TEXT_MESSAGE_APP "SOS: ...")
-static const uint32_t SOS_ACK_DEDUP_MS = 10 * 1000;
-static NodeNum lastSosAckFrom = 0;
-static uint32_t lastSosAckAtMs = 0;
-
-static void sendSosAck(NodeNum dest, ChannelIndex chIndex)
-{
-    // Direct message back to sender; payload chosen to avoid matching isSosAlert().
-    static const char ackPayload[] = "SOS-ACK";
-
-    meshtastic_MeshPacket *p = router->allocForSending();
-    if (!p) {
-        return;
-    }
-
-    p->to = dest;
-    p->channel = chIndex;
-    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
-
-    const size_t len = sizeof(ackPayload) - 1;
-    if (len <= sizeof(p->decoded.payload.bytes)) {
-        memcpy(p->decoded.payload.bytes, ackPayload, len);
-        p->decoded.payload.size = len;
-    } else {
-        // Should never happen, but fail safely.
-        packetPool.release(p);
-        return;
-    }
-
-    service->sendToMesh(p, RX_SRC_LOCAL);
-}
-
 meshtastic_RTTTLConfig rtttlConfig;
 
 ExternalNotificationModule *externalNotificationModule;
@@ -538,19 +506,6 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
             for (size_t i = 0; i < p.payload.size; i++) {
                 if (p.payload.bytes[i] == ASCII_BELL) {
                     containsBell = true;
-                }
-            }
-
-            // SOS auto-ack: reply once per sender within a short window.
-            // ACK is independent of local mute settings (isSilenced / channel mute), because it is for the sender.
-            const bool sos = isSosAlert(mp);
-            if (sos && mp.from && !isBroadcast(mp.from)) {
-                const uint32_t now = millis();
-                if (lastSosAckFrom != mp.from || (uint32_t)(now - lastSosAckAtMs) > SOS_ACK_DEDUP_MS) {
-                    lastSosAckFrom = mp.from;
-                    lastSosAckAtMs = now;
-                    ChannelIndex chIndex = mp.channel ? mp.channel : channels.getPrimaryIndex();
-                    sendSosAck(mp.from, chIndex);
                 }
             }
 

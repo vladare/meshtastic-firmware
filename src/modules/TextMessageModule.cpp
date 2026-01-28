@@ -5,11 +5,80 @@
 #include "PowerFSM.h"
 #include "buzz.h"
 #include "configuration.h"
+#include "mesh/MeshTypes.h"
 #include "graphics/Screen.h"
 #include "graphics/SharedUIDisplay.h"
 #include "graphics/draw/MessageRenderer.h"
 #include "main.h"
 TextMessageModule *textMessageModule;
+
+// Receiver-side SOS auto-ack: one SOS gesture sends 2 packets (ALERT_APP "SOS" + TEXT_MESSAGE_APP "SOS: ..."),
+// so deduplicate by sender for a short window to prevent ACK spam.
+static const uint32_t SOS_ACK_DEDUP_MS = 10 * 1000;
+static NodeNum lastSosAckFrom = 0;
+static uint32_t lastSosAckAtMs = 0;
+
+static bool isSosForAck(const meshtastic_MeshPacket &mp)
+{
+    if (mp.which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
+        return false;
+    }
+
+    const auto &pl = mp.decoded.payload;
+
+    // Case A: ALERT_APP "SOS" (exact)
+    if (mp.decoded.portnum == meshtastic_PortNum_ALERT_APP) {
+        return (pl.size == 3 && pl.bytes[0] == 'S' && pl.bytes[1] == 'O' && pl.bytes[2] == 'S');
+    }
+
+    // Case B: TEXT_MESSAGE_APP "SOS: ..."
+    if (mp.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
+        return (pl.size >= 4 && pl.bytes[0] == 'S' && pl.bytes[1] == 'O' && pl.bytes[2] == 'S' && pl.bytes[3] == ':');
+    }
+
+    return false;
+}
+
+static void maybeSendSosAck(const meshtastic_MeshPacket &mp)
+{
+    if (!isSosForAck(mp)) {
+        return;
+    }
+    if (isFromUs(&mp)) {
+        return;
+    }
+    if (!mp.from || isBroadcast(mp.from)) {
+        return;
+    }
+
+    const uint32_t now = millis();
+    if (mp.from == lastSosAckFrom && (uint32_t)(now - lastSosAckAtMs) < SOS_ACK_DEDUP_MS) {
+        return;
+    }
+
+    // Build a direct message back to the sender, on the same channel as the incoming SOS.
+    meshtastic_MeshPacket *ack = router->allocForSending();
+    if (!ack) {
+        return;
+    }
+
+    ack->to = mp.from;
+    ack->channel = mp.channel; // critical: keep same channel so sender can decrypt/show it
+    ack->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+
+    static const char payload[] = "SOS-ACK"; // must not be "SOS" or start with "SOS:" to avoid loops
+    const size_t len = sizeof(payload) - 1;
+    if (len > sizeof(ack->decoded.payload.bytes)) {
+        packetPool.release(ack);
+        return;
+    }
+    memcpy(ack->decoded.payload.bytes, payload, len);
+    ack->decoded.payload.size = len;
+
+    service->sendToMesh(ack, RX_SRC_LOCAL);
+    lastSosAckFrom = mp.from;
+    lastSosAckAtMs = now;
+}
 
 ProcessMessage TextMessageModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
@@ -17,6 +86,9 @@ ProcessMessage TextMessageModule::handleReceived(const meshtastic_MeshPacket &mp
     auto &p = mp.decoded;
     LOG_INFO("Received text msg from=0x%0x, id=0x%x, msg=%.*s", mp.from, mp.id, p.payload.size, p.payload.bytes);
 #endif
+    // SOS auto-ack is receiver-side logic and should not depend on notification settings.
+    maybeSendSosAck(mp);
+
     // add packet ID to the rolling list of packets
     textPacketList[textPacketListIndex] = mp.id;
     textPacketListIndex = (textPacketListIndex + 1) % TEXT_PACKET_LIST_SIZE;
