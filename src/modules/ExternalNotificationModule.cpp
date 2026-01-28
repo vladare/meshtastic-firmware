@@ -607,6 +607,7 @@ ProcessMessage ExternalNotificationModule::handleReceived(const meshtastic_MeshP
                                            (!isBroadcast(mp.to) && isToUs(&mp)));
                 if (buzzerAllowed) {
                     isNagging = true;
+                    const bool sos = isSosAlert(mp);
                     currentNagSound = sos ? NAG_SOUND_SOS : NAG_SOUND_NORMAL; // set for entire nag cycle, even when !canBuzz()
 
                     if (sos && canBuzz()) {
