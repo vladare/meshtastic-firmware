@@ -15,4 +15,8 @@ Brief reference for the SOS flow and UX. Implementation lives in `SystemCommands
 
 ## Known limitation
 
-With more than two devices, multiple receivers may each send SOS-ACK for the same SOS. The sender plays at most one confirmation sound per SOS gesture (dedup by `ackPlayedForCurrentSos`). No protocol change; behavior is defensive.
+With more than two devices, multiple receivers may each send SOS-ACK for the same SOS.
+  The sender plays at most one confirmation sound per SOS gesture
+  (dedup by `ackPlayedForCurrentSos`). No protocol change; behavior is defensive.
+- SOS-ACK arriving after the sender timeout (~10 s) is ignored for audio playback.
+
