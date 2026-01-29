@@ -106,6 +106,7 @@ ProcessMessage TextMessageModule::handleReceived(const meshtastic_MeshPacket &mp
     // SOS auto-ack is receiver-side logic and should not depend on notification settings.
     maybeSendSosAck(mp);
 
+    // Sender-side: schedule delayed "ta-daa" (~2-3 s after SOS) so user hears "someone received it," not immediate chirp.
     if (isSosAckForUs(mp)) {
         if (externalNotificationModule) {
             externalNotificationModule->scheduleSosAckPlayback();

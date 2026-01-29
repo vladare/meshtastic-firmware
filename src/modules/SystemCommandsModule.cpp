@@ -169,6 +169,7 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
                 service->trySendPosition(NODENUM_BROADCAST, true);
             }
         }
+        // Reset sender-side ACK state so delayed "ta-daa" confirmation can play for this SOS gesture.
         if (externalNotificationModule) {
             externalNotificationModule->onSosSent();
         }

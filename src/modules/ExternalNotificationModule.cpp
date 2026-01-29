@@ -87,7 +87,17 @@ static const uint8_t SOS_FAST_REPEAT_MAX = 3;
 // Deduplicate the 2-packet SOS gesture (ALERT + TEXT) so we don't start twice.
 static const uint32_t SOS_START_DEDUP_MS = 10 * 1000;
 
-// Sender-side SOS-ACK delayed feedback (ta-daa ~2–3 s after SOS).
+/*
+ * Sender-side SOS-ACK confirmation (transmitter only).
+ * Flow: User triggers SOS (long-press) -> SystemCommandsModule sends ALERT_APP + TEXT_MESSAGE_APP ->
+ *       Receiver plays SOS alarm and may send SOS-ACK DM -> Sender receives ACK and schedules one
+ *       delayed "ta-daa" sound (~2-3 s after SOS) so the user hears a clear "someone received it."
+ * Edge cases (verified):
+ * - No ACK ever: pendingAckPlayback is cleared after ACK_MAX_WAIT_MS (10 s); no sound, no stuck state.
+ * - Multiple ACKs for same SOS: at most one sound; scheduleSosAckPlayback() returns early if
+ *   ackPlayedForCurrentSos is already true.
+ * - New SOS gesture: onSosSent() resets all sender-side ACK state so the next ACK can play.
+ */
 static const uint32_t ACK_DELAY_MS = 2500;
 static const uint32_t ACK_MIN_AFTER_SOS_MS = 2000;
 static const uint32_t ACK_MAX_WAIT_MS = 10000;
@@ -95,7 +105,7 @@ static const uint32_t ACK_MAX_WAIT_MS = 10000;
 // (RTTTL standard durations; active buzzer path uses exactly 80-90-280 ms).
 static const char SOS_ACK_RINGTONE[] = "ACK:d=16,o=5,b=188:a5,16p,4d5";
 
-// Sender-side state for one ACK sound per SOS gesture.
+// Sender-side state: one confirmation sound per SOS gesture; cleared on timeout or new SOS.
 static uint32_t lastSosSentAtMs = 0;
 static bool ackPlayedForCurrentSos = false;
 static bool pendingAckPlayback = false;
@@ -218,11 +228,9 @@ int32_t ExternalNotificationModule::runOnce()
         // Sender-side: delayed SOS-ACK playback (one "ta-daa" per SOS gesture).
         if (pendingAckPlayback) {
             if ((uint32_t)(now - ackReceivedAtMs) > ACK_MAX_WAIT_MS) {
-                LOG_DEBUG("SOS-ACK playback cancelled (timeout)");
-                pendingAckPlayback = false;
+                pendingAckPlayback = false; // Timeout: no ACK sound; avoids stuck state.
             } else if ((int32_t)(now - ackPlayAtMs) >= 0) {
                 playSosAckSound(this);
-                LOG_DEBUG("SOS-ACK played (delayed)");
                 ackPlayedForCurrentSos = true;
                 pendingAckPlayback = false;
                 setIntervalFromNow(0);
@@ -437,23 +445,20 @@ void ExternalNotificationModule::onSosSent()
     lastSosSentAtMs = millis();
     ackPlayedForCurrentSos = false;
     pendingAckPlayback = false;
-    LOG_DEBUG("SOS triggered (sender), ACK state reset");
 }
 
 void ExternalNotificationModule::scheduleSosAckPlayback()
 {
-    if (ackPlayedForCurrentSos) {
-        LOG_DEBUG("SOS-ACK ignored (already played for this SOS)");
-        return;
-    }
+    if (ackPlayedForCurrentSos)
+        return; // Multiple ACKs for same SOS: only one confirmation sound.
     const uint32_t now = millis();
     ackReceivedAtMs = now;
+    // Play at least ACK_MIN_AFTER_SOS_MS after SOS trigger so the user perceives "sent, then confirmed."
     const uint32_t fromAck = now + ACK_DELAY_MS;
     const uint32_t fromSos = lastSosSentAtMs + ACK_MIN_AFTER_SOS_MS;
     ackPlayAtMs = (fromAck > fromSos) ? fromAck : fromSos;
     pendingAckPlayback = true;
     setIntervalFromNow(0);
-    LOG_DEBUG("SOS-ACK scheduled at %lu ms", (unsigned long)ackPlayAtMs);
 }
 
 /**
