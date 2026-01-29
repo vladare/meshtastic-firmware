@@ -192,10 +192,10 @@ void playSosAckConfirmationTones()
         config.device.buzzer_gpio = PIN_BUZZER;
 #endif
     if (config.device.buzzer_gpio) {
-        tone(config.device.buzzer_gpio, 1000, 100); // Note 1: 1000 Hz, 100 ms
-        delay(200);                                 // note + 100 ms pause
-        tone(config.device.buzzer_gpio, 1800, 180); // Note 2: 1800 Hz, 180 ms
-        delay(234);                                 // 1.3 * 180
+        tone(config.device.buzzer_gpio, 880, 80);  // Note 1: 880 Hz (A5), 80 ms "ta"
+        delay(170);                                 // 80 ms note + 90 ms pause
+        tone(config.device.buzzer_gpio, 587, 280);  // Note 2: 587 Hz (D5), 280 ms "daa" (descending, resolved)
+        delay(364);                                 // 1.3 * 280
     }
 #endif
 }

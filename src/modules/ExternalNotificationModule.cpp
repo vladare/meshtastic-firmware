@@ -91,7 +91,8 @@ static const uint32_t SOS_START_DEDUP_MS = 10 * 1000;
 static const uint32_t ACK_DELAY_MS = 2500;
 static const uint32_t ACK_MIN_AFTER_SOS_MS = 2000;
 static const uint32_t ACK_MAX_WAIT_MS = 10000;
-static const char SOS_ACK_RINGTONE[] = "ACK:d=16,o=5,b=180:b5,16p,a6";
+// Descending "ta-daa": A5 80ms, pause 90ms, D5 280ms (resolved ending).
+static const char SOS_ACK_RINGTONE[] = "ACK:d=16,o=5,b=200:a5,16p,4d5";
 
 // Sender-side state for one ACK sound per SOS gesture.
 static uint32_t lastSosSentAtMs = 0;
@@ -120,14 +121,14 @@ static void playSosAckSound(ExternalNotificationModule *mod)
         rtttl::begin(config.device.buzzer_gpio, SOS_ACK_RINGTONE);
         return;
     }
-    // Active buzzer / digital pin: two-pulse "ta-daa" (100 ms, pause 100 ms, 180 ms). Works on all architectures
+    // Active buzzer / digital pin: descending "ta-daa" (80 ms, pause 90 ms, 280 ms). Works on all architectures
     // (tone() is unavailable on ESP32/RP2040/PORTDUINO; setExternalState is the universal fallback).
     mod->setExternalState(2, true);
-    delay(100);
+    delay(80);
     mod->setExternalState(2, false);
-    delay(100);
+    delay(90);
     mod->setExternalState(2, true);
-    delay(180);
+    delay(280);
     mod->setExternalState(2, false);
 }
 
