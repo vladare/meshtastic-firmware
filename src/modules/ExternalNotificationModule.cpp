@@ -91,8 +91,9 @@ static const uint32_t SOS_START_DEDUP_MS = 10 * 1000;
 static const uint32_t ACK_DELAY_MS = 2500;
 static const uint32_t ACK_MIN_AFTER_SOS_MS = 2000;
 static const uint32_t ACK_MAX_WAIT_MS = 10000;
-// Descending "ta-daa": A5 80ms, pause 90ms, D5 280ms (resolved ending).
-static const char SOS_ACK_RINGTONE[] = "ACK:d=16,o=5,b=200:a5,16p,4d5";
+// Descending "ta-daa": A5 then D5 (resolved ending). b=188 gives ~80 ms 16th, ~320 ms quarter
+// (RTTTL standard durations; active buzzer path uses exactly 80-90-280 ms).
+static const char SOS_ACK_RINGTONE[] = "ACK:d=16,o=5,b=188:a5,16p,4d5";
 
 // Sender-side state for one ACK sound per SOS gesture.
 static uint32_t lastSosSentAtMs = 0;
