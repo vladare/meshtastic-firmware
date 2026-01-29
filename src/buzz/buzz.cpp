@@ -184,6 +184,22 @@ void resetLeadUpSequence()
     leadUpNoteIndex = 0;
 }
 
+void playSosAckConfirmationTones()
+{
+#if !defined(ARCH_ESP32) && !defined(ARCH_RP2040) && !defined(ARCH_PORTDUINO)
+#ifdef PIN_BUZZER
+    if (!config.device.buzzer_gpio)
+        config.device.buzzer_gpio = PIN_BUZZER;
+#endif
+    if (config.device.buzzer_gpio) {
+        tone(config.device.buzzer_gpio, 1000, 100); // Note 1: 1000 Hz, 100 ms
+        delay(200);                                 // note + 100 ms pause
+        tone(config.device.buzzer_gpio, 1800, 180); // Note 2: 1800 Hz, 180 ms
+        delay(234);                                 // 1.3 * 180
+    }
+#endif
+}
+
 void playComboTune()
 {
     // Quick high-pitched notes with trills

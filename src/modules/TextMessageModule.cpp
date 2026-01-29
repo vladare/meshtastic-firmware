@@ -3,7 +3,6 @@
 #include "MessageStore.h"
 #include "NodeDB.h"
 #include "PowerFSM.h"
-#include "buzz.h"
 #include "configuration.h"
 #include "mesh/MeshTypes.h"
 #include "graphics/Screen.h"
@@ -34,46 +33,6 @@ static inline bool isSosAckForUs(const meshtastic_MeshPacket &mp)
     const auto &pl = mp.decoded.payload;
     return (pl.size == 7 && pl.bytes[0] == 'S' && pl.bytes[1] == 'O' && pl.bytes[2] == 'S' && pl.bytes[3] == '-' &&
             pl.bytes[4] == 'A' && pl.bytes[5] == 'C' && pl.bytes[6] == 'K');
-}
-
-static void playSosAckChirp()
-{
-    if (!externalNotificationModule || !moduleConfig.external_notification.enabled) {
-        return;
-    }
-    if (!moduleConfig.external_notification.alert_message_buzzer || externalNotificationModule->getMute()) {
-        return;
-    }
-    if (!externalNotificationModule->canBuzz()) {
-        return;
-    }
-
-    static const char SOS_ACK_RINGTONE[] = "ACK:d=32,o=6,b=240:c7,16p,g7";
-
-#ifdef HAS_I2S
-    if (moduleConfig.external_notification.use_i2s_as_buzzer) {
-        if (audioThread) {
-            audioThread->beginRttl(SOS_ACK_RINGTONE, strlen(SOS_ACK_RINGTONE));
-        }
-        return;
-    }
-#endif
-
-    if (moduleConfig.external_notification.use_pwm && config.device.buzzer_gpio) {
-        rtttl::begin(config.device.buzzer_gpio, SOS_ACK_RINGTONE);
-        return;
-    }
-
-    // Active buzzer / digital pin: quick two-pulse chirp.
-    if (!moduleConfig.external_notification.use_pwm && !moduleConfig.external_notification.use_i2s_as_buzzer) {
-        externalNotificationModule->setExternalState(2, true);
-        delay(40);
-        externalNotificationModule->setExternalState(2, false);
-        delay(30);
-        externalNotificationModule->setExternalState(2, true);
-        delay(70);
-        externalNotificationModule->setExternalState(2, false);
-    }
 }
 
 static bool isSosForAck(const meshtastic_MeshPacket &mp)
@@ -148,7 +107,9 @@ ProcessMessage TextMessageModule::handleReceived(const meshtastic_MeshPacket &mp
     maybeSendSosAck(mp);
 
     if (isSosAckForUs(mp)) {
-        playSosAckChirp();
+        if (externalNotificationModule) {
+            externalNotificationModule->scheduleSosAckPlayback();
+        }
     }
 
     // add packet ID to the rolling list of packets

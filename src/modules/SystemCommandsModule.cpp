@@ -169,6 +169,9 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
                 service->trySendPosition(NODENUM_BROADCAST, true);
             }
         }
+        if (externalNotificationModule) {
+            externalNotificationModule->onSosSent();
+        }
         return true;
     }
 

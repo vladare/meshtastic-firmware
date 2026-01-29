@@ -51,6 +51,11 @@ class ExternalNotificationModule : public SinglePortModule, private concurrency:
 
     void stopNow();
 
+    /** Sender-side: call when SOS was just sent; resets ACK playback state for delayed "ta-daa" feedback. */
+    void onSosSent();
+    /** Sender-side: schedule one delayed SOS-ACK sound (2–3 s after SOS). Call when SOS-ACK packet received. */
+    void scheduleSosAckPlayback();
+
     void handleGetRingtone(const meshtastic_MeshPacket &req, meshtastic_AdminMessage *response);
     void handleSetRingtone(const char *from_msg);
 

@@ -18,7 +18,6 @@
 #include "NodeDB.h"
 #include "RTC.h"
 #include "Router.h"
-#include "buzz/buzz.h"
 #include "configuration.h"
 #include "main.h"
 #include "mesh/generated/meshtastic/mesh.pb.h"
@@ -87,6 +86,50 @@ static const uint32_t SOS_SLOW_REPEAT_MS = 15 * 60 * 1000;
 static const uint8_t SOS_FAST_REPEAT_MAX = 3;
 // Deduplicate the 2-packet SOS gesture (ALERT + TEXT) so we don't start twice.
 static const uint32_t SOS_START_DEDUP_MS = 10 * 1000;
+
+// Sender-side SOS-ACK delayed feedback (ta-daa ~2–3 s after SOS).
+static const uint32_t ACK_DELAY_MS = 2500;
+static const uint32_t ACK_MIN_AFTER_SOS_MS = 2000;
+static const uint32_t ACK_MAX_WAIT_MS = 10000;
+static const char SOS_ACK_RINGTONE[] = "ACK:d=16,o=5,b=180:b5,16p,a6";
+
+// Sender-side state for one ACK sound per SOS gesture.
+static uint32_t lastSosSentAtMs = 0;
+static bool ackPlayedForCurrentSos = false;
+static bool pendingAckPlayback = false;
+static uint32_t ackReceivedAtMs = 0;
+static uint32_t ackPlayAtMs = 0;
+
+/** Sender-side: play the "ta-daa" ACK confirmation once. Respects enabled, alert_message_buzzer, mute, canBuzz(). */
+static void playSosAckSound(ExternalNotificationModule *mod)
+{
+    if (!mod || !moduleConfig.external_notification.enabled)
+        return;
+    if (!moduleConfig.external_notification.alert_message_buzzer || mod->getMute())
+        return;
+    if (!mod->canBuzz())
+        return;
+    if (moduleConfig.external_notification.use_i2s_as_buzzer) {
+#ifdef HAS_I2S
+        if (audioThread)
+            audioThread->beginRttl(SOS_ACK_RINGTONE, strlen(SOS_ACK_RINGTONE));
+#endif
+        return;
+    }
+    if (moduleConfig.external_notification.use_pwm && config.device.buzzer_gpio) {
+        rtttl::begin(config.device.buzzer_gpio, SOS_ACK_RINGTONE);
+        return;
+    }
+    // Active buzzer / digital pin: two-pulse "ta-daa" (100 ms, pause 100 ms, 180 ms). Works on all architectures
+    // (tone() is unavailable on ESP32/RP2040/PORTDUINO; setExternalState is the universal fallback).
+    mod->setExternalState(2, true);
+    delay(100);
+    mod->setExternalState(2, false);
+    delay(100);
+    mod->setExternalState(2, true);
+    delay(180);
+    mod->setExternalState(2, false);
+}
 
 /**
  * @brief Returns true iff the packet is an SOS alert for notification sound purposes.
@@ -169,6 +212,20 @@ int32_t ExternalNotificationModule::runOnce()
         isRtttlPlaying = isRtttlPlaying || audioThread->isPlaying();
 #endif
         const uint32_t now = millis();
+
+        // Sender-side: delayed SOS-ACK playback (one "ta-daa" per SOS gesture).
+        if (pendingAckPlayback) {
+            if ((uint32_t)(now - ackReceivedAtMs) > ACK_MAX_WAIT_MS) {
+                LOG_DEBUG("SOS-ACK playback cancelled (timeout)");
+                pendingAckPlayback = false;
+            } else if ((int32_t)(now - ackPlayAtMs) >= 0) {
+                playSosAckSound(this);
+                LOG_DEBUG("SOS-ACK played (delayed)");
+                ackPlayedForCurrentSos = true;
+                pendingAckPlayback = false;
+                setIntervalFromNow(0);
+            }
+        }
 
         if ((nagCycleCutoff < now) && !isRtttlPlaying) {
             // Turn off external notification immediately when timeout is reached, regardless of song state
@@ -339,6 +396,19 @@ int32_t ExternalNotificationModule::runOnce()
             delay = min(delay, (uint32_t)untilRepeatMs);
         }
 
+        // Sender-side: wake in time for ACK playback or timeout.
+        if (pendingAckPlayback) {
+            int32_t untilPlayMs = (int32_t)(ackPlayAtMs - millis());
+            if (untilPlayMs < 0)
+                untilPlayMs = 0;
+            uint32_t untilTimeoutMs = ACK_MAX_WAIT_MS - (millis() - ackReceivedAtMs);
+            if ((int32_t)untilTimeoutMs < 0)
+                untilTimeoutMs = 0;
+            delay = min(delay, min((uint32_t)untilPlayMs, untilTimeoutMs));
+            if (delay < EXT_NOTIFICATION_FAST_THREAD_MS)
+                delay = EXT_NOTIFICATION_FAST_THREAD_MS;
+        }
+
         return delay;
     }
 }
@@ -358,6 +428,30 @@ bool ExternalNotificationModule::canBuzz()
 bool ExternalNotificationModule::wantPacket(const meshtastic_MeshPacket *p)
 {
     return MeshService::isTextPayload(p);
+}
+
+void ExternalNotificationModule::onSosSent()
+{
+    lastSosSentAtMs = millis();
+    ackPlayedForCurrentSos = false;
+    pendingAckPlayback = false;
+    LOG_DEBUG("SOS triggered (sender), ACK state reset");
+}
+
+void ExternalNotificationModule::scheduleSosAckPlayback()
+{
+    if (ackPlayedForCurrentSos) {
+        LOG_DEBUG("SOS-ACK ignored (already played for this SOS)");
+        return;
+    }
+    const uint32_t now = millis();
+    ackReceivedAtMs = now;
+    const uint32_t fromAck = now + ACK_DELAY_MS;
+    const uint32_t fromSos = lastSosSentAtMs + ACK_MIN_AFTER_SOS_MS;
+    ackPlayAtMs = (fromAck > fromSos) ? fromAck : fromSos;
+    pendingAckPlayback = true;
+    setIntervalFromNow(0);
+    LOG_DEBUG("SOS-ACK scheduled at %lu ms", (unsigned long)ackPlayAtMs);
 }
 
 /**
