@@ -2,6 +2,7 @@
 
 #if defined(TRACKER_T1000_E)
 
+#include "BoardFinderEngine.h"
 #include "SinglePortModule.h"
 #include "boardfinder_protocol.h"
 #include "concurrency/Lock.h"
@@ -21,14 +22,26 @@ class BoardFinderModule : public SinglePortModule
     meshtastic_MeshPacket *allocReply() override;
 
   private:
+    struct Prefs {
+        bool ble_burst_enabled = false;
+        boardfinder::DeviceRole device_role = boardfinder::DeviceRole::NORMAL;
+        uint32_t rider_node_id = 0;
+        bool board_armed = false;
+    };
+
     static concurrency::Lock &prefsLock();
-    static bool loadPrefs(bool &enabled);
-    static bool savePrefs(bool enabled);
+    static bool loadPrefs(Prefs &out);
+    static bool savePrefs(const Prefs &in);
     static bool isLocalPhoneConfigRequest(const meshtastic_MeshPacket &mp);
 
-    void replyConfig(uint32_t requestId, bool enabled);
+    void applyRuntime(bool restartIfArmed);
+    bool persistIfChanged(const Prefs &next);
     void replyError(uint32_t requestId, boardfinder::ErrorCode code);
+    void replyConfig(uint32_t requestId);
+    void replyBoardStatus(uint32_t requestId);
+    void deliverReply(const meshtastic_MeshPacket &mp);
 
+    Prefs prefs{};
     boardfinder::Message pendingReply{};
     bool hasPendingReply = false;
 };

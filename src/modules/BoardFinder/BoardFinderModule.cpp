@@ -5,11 +5,10 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "SPILock.h"
-#include "power/PowerHAL.h"
 #include "SafeFile.h"
 #include "configuration.h"
 #include "main.h"
-#include "platform/nrf52/T1000eBleBurst.h"
+#include "power/PowerHAL.h"
 #include <cstring>
 
 BoardFinderModule *boardFinderModule;
@@ -18,14 +17,30 @@ namespace
 {
 constexpr const char *kPrefsPath = "/prefs/boardfinder.proto";
 constexpr uint32_t kPrefsMagic = 0xBF100001u;
-constexpr uint32_t kPrefsVersion = 1;
+constexpr uint32_t kPrefsVersionV1 = 1;
+constexpr uint32_t kPrefsVersion = 2;
 
-struct PrefsRecord {
+struct PrefsRecordV1 {
     uint32_t magic;
     uint32_t version;
     uint8_t ble_burst_enabled;
     uint8_t reserved[3];
 };
+
+struct PrefsRecord {
+    uint32_t magic;
+    uint32_t version;
+    uint8_t ble_burst_enabled;
+    uint8_t device_role;
+    uint8_t board_armed;
+    uint8_t reserved;
+    uint32_t rider_node_id;
+};
+
+bool roleValid(uint32_t v)
+{
+    return v <= static_cast<uint32_t>(boardfinder::DeviceRole::BOARD);
+}
 } // namespace
 
 concurrency::Lock &BoardFinderModule::prefsLock()
@@ -36,17 +51,17 @@ concurrency::Lock &BoardFinderModule::prefsLock()
 
 BoardFinderModule::BoardFinderModule() : SinglePortModule("BoardFinder", meshtastic_PortNum_PRIVATE_APP)
 {
-    bool enabled = false;
-    loadPrefs(enabled);
-    t1000eBurstSetEnabled(enabled);
-    LOG_INFO("BoardFinder module ready, ble_burst_enabled=%d", enabled ? 1 : 0);
+    loadPrefs(prefs);
+    boardFinderEngine = new BoardFinderEngine();
+    applyRuntime(true);
+    LOG_INFO("BoardFinder ready role=%u burst=%d armed=%d rider=0x%08x", static_cast<unsigned>(prefs.device_role),
+             prefs.ble_burst_enabled ? 1 : 0, prefs.board_armed ? 1 : 0, prefs.rider_node_id);
 }
 
 bool BoardFinderModule::isLocalPhoneConfigRequest(const meshtastic_MeshPacket &mp)
 {
     // from==0 is the Phone API local convention (same as AdminModule).
-    // RadioLibInterface drops air packets with from==0, so LoRa spoof of local Node ID
-    // cannot pass this gate. Not a cryptographic Phone API proof.
+    // RadioLibInterface drops air packets with from==0.
     if (mp.from != 0)
         return false;
     if (isBroadcast(mp.to) || !isToUs(&mp))
@@ -54,9 +69,9 @@ bool BoardFinderModule::isLocalPhoneConfigRequest(const meshtastic_MeshPacket &m
     return true;
 }
 
-bool BoardFinderModule::loadPrefs(bool &enabled)
+bool BoardFinderModule::loadPrefs(Prefs &out)
 {
-    enabled = false;
+    out = Prefs{};
     concurrency::LockGuard guard(&prefsLock());
 #ifdef FSCom
     concurrency::LockGuard spi(spiLock);
@@ -67,23 +82,53 @@ bool BoardFinderModule::loadPrefs(bool &enabled)
     if (!f)
         return false;
 
-    PrefsRecord rec{};
-    const size_t n = f.read(reinterpret_cast<uint8_t *>(&rec), sizeof(rec));
+    uint8_t buf[sizeof(PrefsRecord)] = {};
+    const size_t n = f.read(buf, sizeof(buf));
     f.close();
-    if (n != sizeof(rec) || rec.magic != kPrefsMagic || rec.version == 0 || rec.version > kPrefsVersion) {
-        LOG_WARN("BoardFinder prefs invalid; defaulting OFF");
-        enabled = false;
+
+    if (n == sizeof(PrefsRecordV1)) {
+        PrefsRecordV1 v1{};
+        memcpy(&v1, buf, sizeof(v1));
+        if (v1.magic != kPrefsMagic || v1.version != kPrefsVersionV1) {
+            LOG_WARN("BoardFinder prefs v1 invalid; defaults");
+            return false;
+        }
+        // Migration: preserve ble_burst_enabled. Role stays NORMAL so Rider advertising
+        // continues for existing users until an explicit role is configured.
+        out.ble_burst_enabled = v1.ble_burst_enabled != 0;
+        out.device_role = boardfinder::DeviceRole::NORMAL;
+        out.rider_node_id = 0;
+        out.board_armed = false;
+        LOG_INFO("BoardFinder migrated prefs v1->v2 burst=%d", out.ble_burst_enabled ? 1 : 0);
+        return true;
+    }
+
+    if (n != sizeof(PrefsRecord)) {
+        LOG_WARN("BoardFinder prefs size mismatch; defaults");
         return false;
     }
-    enabled = rec.ble_burst_enabled != 0;
+
+    PrefsRecord rec{};
+    memcpy(&rec, buf, sizeof(rec));
+    if (rec.magic != kPrefsMagic || rec.version == 0 || rec.version > kPrefsVersion || !roleValid(rec.device_role)) {
+        LOG_WARN("BoardFinder prefs invalid; defaults");
+        return false;
+    }
+
+    out.ble_burst_enabled = rec.ble_burst_enabled != 0;
+    out.device_role = static_cast<boardfinder::DeviceRole>(rec.device_role);
+    out.board_armed = rec.board_armed != 0;
+    out.rider_node_id = rec.rider_node_id;
+    if (out.rider_node_id == 0)
+        out.board_armed = false;
     return true;
 #else
-    (void)enabled;
+    (void)out;
     return true;
 #endif
 }
 
-bool BoardFinderModule::savePrefs(bool enabled)
+bool BoardFinderModule::savePrefs(const Prefs &in)
 {
     concurrency::LockGuard guard(&prefsLock());
 #ifdef FSCom
@@ -95,7 +140,10 @@ bool BoardFinderModule::savePrefs(bool enabled)
     PrefsRecord rec{};
     rec.magic = kPrefsMagic;
     rec.version = kPrefsVersion;
-    rec.ble_burst_enabled = enabled ? 1 : 0;
+    rec.ble_burst_enabled = in.ble_burst_enabled ? 1 : 0;
+    rec.device_role = static_cast<uint8_t>(in.device_role);
+    rec.board_armed = in.board_armed ? 1 : 0;
+    rec.rider_node_id = in.rider_node_id;
 
     SafeFile f(kPrefsPath, true);
     size_t written = f.write(reinterpret_cast<const uint8_t *>(&rec), sizeof(rec));
@@ -104,22 +152,33 @@ bool BoardFinderModule::savePrefs(bool enabled)
         LOG_ERROR("BoardFinder prefs save failed");
     return ok;
 #else
-    (void)enabled;
+    (void)in;
     return false;
 #endif
 }
 
-void BoardFinderModule::replyConfig(uint32_t requestId, bool enabled)
+bool BoardFinderModule::persistIfChanged(const Prefs &next)
 {
-    pendingReply = boardfinder::Message{};
-    pendingReply.protocol_version = boardfinder::PROTOCOL_VERSION;
-    pendingReply.request_id = requestId;
-    pendingReply.command = boardfinder::Command::CONFIG_RESPONSE;
-    pendingReply.ble_burst_enabled = enabled;
-    pendingReply.has_ble_burst_enabled = true;
-    pendingReply.status = boardfinder::Status::OK;
-    pendingReply.error_code = boardfinder::ErrorCode::NONE;
-    hasPendingReply = true;
+    if (next.ble_burst_enabled == prefs.ble_burst_enabled && next.device_role == prefs.device_role &&
+        next.rider_node_id == prefs.rider_node_id && next.board_armed == prefs.board_armed) {
+        return true;
+    }
+    if (!savePrefs(next))
+        return false;
+    prefs = next;
+    return true;
+}
+
+void BoardFinderModule::applyRuntime(bool restartIfArmed)
+{
+    if (!boardFinderEngine)
+        return;
+    BoardFinderEngine::Config cfg{};
+    cfg.role = prefs.device_role;
+    cfg.rider_node_id = prefs.rider_node_id;
+    cfg.board_armed = prefs.board_armed;
+    cfg.ble_burst_enabled = prefs.ble_burst_enabled;
+    boardFinderEngine->applyConfig(cfg, restartIfArmed);
 }
 
 void BoardFinderModule::replyError(uint32_t requestId, boardfinder::ErrorCode code)
@@ -133,6 +192,83 @@ void BoardFinderModule::replyError(uint32_t requestId, boardfinder::ErrorCode co
     hasPendingReply = true;
 }
 
+void BoardFinderModule::replyConfig(uint32_t requestId)
+{
+    pendingReply = boardfinder::Message{};
+    pendingReply.protocol_version = boardfinder::PROTOCOL_VERSION;
+    pendingReply.request_id = requestId;
+    pendingReply.command = boardfinder::Command::CONFIG_RESPONSE;
+    pendingReply.ble_burst_enabled = prefs.ble_burst_enabled;
+    pendingReply.has_ble_burst_enabled = true;
+    pendingReply.device_role = prefs.device_role;
+    pendingReply.has_device_role = true;
+    pendingReply.rider_node_id = prefs.rider_node_id;
+    pendingReply.has_rider_node_id = true;
+    pendingReply.board_armed = prefs.board_armed;
+    pendingReply.has_board_armed = true;
+    pendingReply.status = boardfinder::Status::OK;
+    pendingReply.error_code = boardfinder::ErrorCode::NONE;
+    hasPendingReply = true;
+}
+
+void BoardFinderModule::replyBoardStatus(uint32_t requestId)
+{
+    auto snap = boardFinderEngine ? boardFinderEngine->status() : BoardFinderEngine::StatusSnapshot{};
+    pendingReply = boardfinder::Message{};
+    pendingReply.protocol_version = boardfinder::PROTOCOL_VERSION;
+    pendingReply.request_id = requestId;
+    pendingReply.command = boardfinder::Command::BOARD_STATUS_RESPONSE;
+    pendingReply.ble_burst_enabled = prefs.ble_burst_enabled;
+    pendingReply.has_ble_burst_enabled = true;
+    pendingReply.device_role = prefs.device_role;
+    pendingReply.has_device_role = true;
+    pendingReply.rider_node_id = prefs.rider_node_id;
+    pendingReply.has_rider_node_id = true;
+    pendingReply.board_armed = snap.board_armed;
+    pendingReply.has_board_armed = true;
+    pendingReply.board_state = snap.board_state;
+    pendingReply.has_board_state = true;
+    pendingReply.synchronized = snap.synchronized;
+    pendingReply.has_synchronized = true;
+    pendingReply.consecutive_missed_bursts = snap.consecutive_missed_bursts;
+    pendingReply.has_consecutive_missed_bursts = true;
+    if (snap.has_last_rider_rssi) {
+        pendingReply.last_rider_rssi = snap.last_rider_rssi;
+        pendingReply.has_last_rider_rssi = true;
+    }
+    if (snap.has_last_rider_seen_age_seconds) {
+        pendingReply.last_rider_seen_age_seconds = snap.last_rider_seen_age_seconds;
+        pendingReply.has_last_rider_seen_age_seconds = true;
+    }
+    pendingReply.gps_tracking_active = snap.gps_tracking_active;
+    pendingReply.has_gps_tracking_active = true;
+    pendingReply.last_gps_report_status = snap.last_gps_report_status;
+    pendingReply.has_last_gps_report_status = true;
+    pendingReply.status = boardfinder::Status::OK;
+    pendingReply.error_code = boardfinder::ErrorCode::NONE;
+    hasPendingReply = true;
+}
+
+void BoardFinderModule::deliverReply(const meshtastic_MeshPacket &mp)
+{
+    if (!hasPendingReply || service == nullptr || nodeDB == nullptr)
+        return;
+    uint8_t buf[boardfinder::MAX_MESSAGE_BYTES];
+    size_t len = boardfinder::encodeMessage(pendingReply, buf, sizeof(buf));
+    hasPendingReply = false;
+    if (len == 0)
+        return;
+    meshtastic_MeshPacket *p = allocDataPacket();
+    p->to = nodeDB->getNodeNum();
+    p->from = nodeDB->getNodeNum();
+    p->hop_limit = 0;
+    p->want_ack = false;
+    p->decoded.request_id = mp.id;
+    p->decoded.payload.size = static_cast<pb_size_t>(len);
+    memcpy(p->decoded.payload.bytes, buf, len);
+    service->sendToPhone(p);
+}
+
 ProcessMessage BoardFinderModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
     if (mp.which_payload_variant != meshtastic_MeshPacket_decoded_tag ||
@@ -143,74 +279,153 @@ ProcessMessage BoardFinderModule::handleReceived(const meshtastic_MeshPacket &mp
     hasPendingReply = false;
 
     if (!isLocalPhoneConfigRequest(mp)) {
-        LOG_WARN("BoardFinder rejected non-local PRIVATE_APP config packet from=0x%x to=0x%x", mp.from, mp.to);
-        // No reply over LoRa for remote attempts.
+        LOG_WARN("BoardFinder rejected non-local PRIVATE_APP from=0x%x to=0x%x", mp.from, mp.to);
         return ProcessMessage::STOP;
     }
 
     boardfinder::Message req{};
     if (!boardfinder::decodeMessage(mp.decoded.payload.bytes, mp.decoded.payload.size, req)) {
         replyError(0, boardfinder::ErrorCode::MALFORMED);
+        deliverReply(mp);
         return ProcessMessage::STOP;
     }
 
-    if (req.protocol_version == 0 || req.protocol_version > boardfinder::PROTOCOL_VERSION) {
+    if (req.protocol_version < boardfinder::PROTOCOL_VERSION_MIN || req.protocol_version > boardfinder::PROTOCOL_VERSION) {
         replyError(req.request_id, boardfinder::ErrorCode::UNSUPPORTED_VERSION);
+        deliverReply(mp);
         return ProcessMessage::STOP;
     }
 
     switch (req.command) {
-    case boardfinder::Command::GET_CONFIG: {
-        bool enabled = t1000eBurstIsEnabled();
-        replyConfig(req.request_id, enabled);
+    case boardfinder::Command::GET_CONFIG:
+        replyConfig(req.request_id);
         break;
-    }
+
     case boardfinder::Command::SET_CONFIG: {
-        if (!req.has_ble_burst_enabled) {
+        if (!req.has_ble_burst_enabled && !req.has_device_role && !req.has_rider_node_id) {
             replyError(req.request_id, boardfinder::ErrorCode::MALFORMED);
             break;
         }
-        const bool current = t1000eBurstIsEnabled();
-        if (current != req.ble_burst_enabled) {
-            if (!savePrefs(req.ble_burst_enabled)) {
-                replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
+        Prefs next = prefs;
+        if (req.has_ble_burst_enabled)
+            next.ble_burst_enabled = req.ble_burst_enabled;
+        if (req.has_device_role) {
+            if (!roleValid(static_cast<uint32_t>(req.device_role))) {
+                replyError(req.request_id, boardfinder::ErrorCode::INVALID_ROLE);
                 break;
             }
-            t1000eBurstSetEnabled(req.ble_burst_enabled);
-            t1000eBurstReapply();
+            next.device_role = req.device_role;
+            if (next.device_role != boardfinder::DeviceRole::BOARD)
+                next.board_armed = false;
         }
-        replyConfig(req.request_id, t1000eBurstIsEnabled());
+        if (req.has_rider_node_id) {
+            if (prefs.board_armed && req.rider_node_id != prefs.rider_node_id) {
+                // Changing Rider while armed: force disarm then apply.
+                next.board_armed = false;
+            }
+            next.rider_node_id = req.rider_node_id;
+            if (next.rider_node_id == 0)
+                next.board_armed = false;
+        }
+        if (!persistIfChanged(next)) {
+            replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
+            break;
+        }
+        applyRuntime(true);
+        replyConfig(req.request_id);
         break;
     }
+
+    case boardfinder::Command::SET_DEVICE_ROLE: {
+        if (!req.has_device_role || !roleValid(static_cast<uint32_t>(req.device_role))) {
+            replyError(req.request_id, boardfinder::ErrorCode::INVALID_ROLE);
+            break;
+        }
+        Prefs next = prefs;
+        next.device_role = req.device_role;
+        if (next.device_role != boardfinder::DeviceRole::BOARD)
+            next.board_armed = false;
+        if (!persistIfChanged(next)) {
+            replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
+            break;
+        }
+        applyRuntime(true);
+        replyConfig(req.request_id);
+        break;
+    }
+
+    case boardfinder::Command::SET_RIDER_NODE_ID: {
+        if (!req.has_rider_node_id) {
+            replyError(req.request_id, boardfinder::ErrorCode::MALFORMED);
+            break;
+        }
+        Prefs next = prefs;
+        if (prefs.board_armed && req.rider_node_id != prefs.rider_node_id)
+            next.board_armed = false;
+        next.rider_node_id = req.rider_node_id;
+        if (next.rider_node_id == 0)
+            next.board_armed = false;
+        if (!persistIfChanged(next)) {
+            replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
+            break;
+        }
+        applyRuntime(true);
+        replyConfig(req.request_id);
+        break;
+    }
+
+    case boardfinder::Command::ARM_BOARD: {
+        if (prefs.device_role != boardfinder::DeviceRole::BOARD) {
+            replyError(req.request_id, boardfinder::ErrorCode::NOT_BOARD);
+            break;
+        }
+        if (prefs.rider_node_id == 0) {
+            replyError(req.request_id, boardfinder::ErrorCode::RIDER_UNASSIGNED);
+            break;
+        }
+        Prefs next = prefs;
+        next.board_armed = true;
+        if (!persistIfChanged(next)) {
+            replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
+            break;
+        }
+        auto err = boardFinderEngine ? boardFinderEngine->arm() : boardfinder::ErrorCode::INTERNAL;
+        if (err != boardfinder::ErrorCode::NONE) {
+            replyError(req.request_id, err);
+            break;
+        }
+        replyBoardStatus(req.request_id);
+        break;
+    }
+
+    case boardfinder::Command::DISARM_BOARD: {
+        Prefs next = prefs;
+        next.board_armed = false;
+        if (!persistIfChanged(next)) {
+            replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
+            break;
+        }
+        if (boardFinderEngine)
+            boardFinderEngine->disarm();
+        replyBoardStatus(req.request_id);
+        break;
+    }
+
+    case boardfinder::Command::GET_BOARD_STATUS:
+        replyBoardStatus(req.request_id);
+        break;
+
     default:
         replyError(req.request_id, boardfinder::ErrorCode::UNSUPPORTED_COMMAND);
         break;
     }
 
-    // Deliver only to the local phone queue. Never call sendToMesh for config responses.
-    if (hasPendingReply && service != nullptr && nodeDB != nullptr) {
-        uint8_t buf[boardfinder::MAX_MESSAGE_BYTES];
-        size_t len = boardfinder::encodeMessage(pendingReply, buf, sizeof(buf));
-        hasPendingReply = false;
-        if (len != 0) {
-            meshtastic_MeshPacket *p = allocDataPacket();
-            p->to = nodeDB->getNodeNum();
-            p->from = nodeDB->getNodeNum();
-            p->hop_limit = 0;
-            p->want_ack = false;
-            p->decoded.request_id = mp.id;
-            p->decoded.payload.size = static_cast<pb_size_t>(len);
-            memcpy(p->decoded.payload.bytes, buf, len);
-            service->sendToPhone(p);
-        }
-    }
-
+    deliverReply(mp);
     return ProcessMessage::STOP;
 }
 
 meshtastic_MeshPacket *BoardFinderModule::allocReply()
 {
-    // Responses are queued directly with sendToPhone above.
     return nullptr;
 }
 

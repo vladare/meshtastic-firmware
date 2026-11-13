@@ -11,6 +11,16 @@ constexpr uint8_t TAG_COMMAND = 3;
 constexpr uint8_t TAG_BLE_BURST_ENABLED = 4;
 constexpr uint8_t TAG_STATUS = 5;
 constexpr uint8_t TAG_ERROR_CODE = 6;
+constexpr uint8_t TAG_DEVICE_ROLE = 7;
+constexpr uint8_t TAG_RIDER_NODE_ID = 8;
+constexpr uint8_t TAG_BOARD_ARMED = 9;
+constexpr uint8_t TAG_BOARD_STATE = 10;
+constexpr uint8_t TAG_SYNCHRONIZED = 11;
+constexpr uint8_t TAG_CONSECUTIVE_MISSED = 12;
+constexpr uint8_t TAG_LAST_RIDER_RSSI = 13;
+constexpr uint8_t TAG_LAST_RIDER_SEEN_AGE = 14;
+constexpr uint8_t TAG_GPS_TRACKING_ACTIVE = 15;
+constexpr uint8_t TAG_LAST_GPS_REPORT_STATUS = 16;
 
 bool writeByte(uint8_t **pp, uint8_t *end, uint8_t v)
 {
@@ -32,10 +42,19 @@ bool writeVarint(uint8_t **pp, uint8_t *end, uint32_t v)
 
 bool writeKeyVarint(uint8_t **pp, uint8_t *end, uint8_t fieldNumber, uint32_t v)
 {
-    // wire type 0 = varint
     if (!writeVarint(pp, end, static_cast<uint32_t>(fieldNumber) << 3))
         return false;
     return writeVarint(pp, end, v);
+}
+
+uint32_t zigzagEncode(int32_t v)
+{
+    return (static_cast<uint32_t>(v) << 1) ^ static_cast<uint32_t>(v >> 31);
+}
+
+int32_t zigzagDecode(uint32_t v)
+{
+    return static_cast<int32_t>((v >> 1) ^ (~(v & 1) + 1));
 }
 
 bool readVarint(const uint8_t **pp, const uint8_t *end, uint32_t &out)
@@ -56,6 +75,12 @@ bool readVarint(const uint8_t **pp, const uint8_t *end, uint32_t &out)
     return false;
 }
 
+bool wantsBleBurstField(const Message &msg)
+{
+    return msg.has_ble_burst_enabled || msg.command == Command::CONFIG_RESPONSE || msg.command == Command::SET_CONFIG ||
+           msg.command == Command::BOARD_STATUS_RESPONSE;
+}
+
 } // namespace
 
 size_t encodeMessage(const Message &msg, uint8_t *out, size_t outMax)
@@ -72,7 +97,7 @@ size_t encodeMessage(const Message &msg, uint8_t *out, size_t outMax)
         return 0;
     if (!writeKeyVarint(&p, end, TAG_COMMAND, static_cast<uint32_t>(msg.command)))
         return 0;
-    if (msg.has_ble_burst_enabled || msg.command == Command::CONFIG_RESPONSE || msg.command == Command::SET_CONFIG) {
+    if (wantsBleBurstField(msg)) {
         if (!writeKeyVarint(&p, end, TAG_BLE_BURST_ENABLED, msg.ble_burst_enabled ? 1u : 0u))
             return 0;
     }
@@ -80,6 +105,49 @@ size_t encodeMessage(const Message &msg, uint8_t *out, size_t outMax)
         return 0;
     if (!writeKeyVarint(&p, end, TAG_ERROR_CODE, static_cast<uint32_t>(msg.error_code)))
         return 0;
+
+    if (msg.has_device_role || msg.command == Command::CONFIG_RESPONSE || msg.command == Command::BOARD_STATUS_RESPONSE ||
+        msg.command == Command::SET_DEVICE_ROLE) {
+        if (!writeKeyVarint(&p, end, TAG_DEVICE_ROLE, static_cast<uint32_t>(msg.device_role)))
+            return 0;
+    }
+    if (msg.has_rider_node_id || msg.command == Command::CONFIG_RESPONSE || msg.command == Command::BOARD_STATUS_RESPONSE ||
+        msg.command == Command::SET_RIDER_NODE_ID) {
+        if (!writeKeyVarint(&p, end, TAG_RIDER_NODE_ID, msg.rider_node_id))
+            return 0;
+    }
+    if (msg.has_board_armed || msg.command == Command::BOARD_STATUS_RESPONSE) {
+        if (!writeKeyVarint(&p, end, TAG_BOARD_ARMED, msg.board_armed ? 1u : 0u))
+            return 0;
+    }
+    if (msg.has_board_state || msg.command == Command::BOARD_STATUS_RESPONSE) {
+        if (!writeKeyVarint(&p, end, TAG_BOARD_STATE, static_cast<uint32_t>(msg.board_state)))
+            return 0;
+    }
+    if (msg.has_synchronized || msg.command == Command::BOARD_STATUS_RESPONSE) {
+        if (!writeKeyVarint(&p, end, TAG_SYNCHRONIZED, msg.synchronized ? 1u : 0u))
+            return 0;
+    }
+    if (msg.has_consecutive_missed_bursts || msg.command == Command::BOARD_STATUS_RESPONSE) {
+        if (!writeKeyVarint(&p, end, TAG_CONSECUTIVE_MISSED, msg.consecutive_missed_bursts))
+            return 0;
+    }
+    if (msg.has_last_rider_rssi) {
+        if (!writeKeyVarint(&p, end, TAG_LAST_RIDER_RSSI, zigzagEncode(msg.last_rider_rssi)))
+            return 0;
+    }
+    if (msg.has_last_rider_seen_age_seconds) {
+        if (!writeKeyVarint(&p, end, TAG_LAST_RIDER_SEEN_AGE, msg.last_rider_seen_age_seconds))
+            return 0;
+    }
+    if (msg.has_gps_tracking_active || msg.command == Command::BOARD_STATUS_RESPONSE) {
+        if (!writeKeyVarint(&p, end, TAG_GPS_TRACKING_ACTIVE, msg.gps_tracking_active ? 1u : 0u))
+            return 0;
+    }
+    if (msg.has_last_gps_report_status || msg.command == Command::BOARD_STATUS_RESPONSE) {
+        if (!writeKeyVarint(&p, end, TAG_LAST_GPS_REPORT_STATUS, static_cast<uint32_t>(msg.last_gps_report_status)))
+            return 0;
+    }
 
     return static_cast<size_t>(p - out);
 }
@@ -101,7 +169,6 @@ bool decodeMessage(const uint8_t *in, size_t inLen, Message &out)
         uint32_t field = key >> 3;
         uint32_t wire = key & 0x7;
         if (wire != 0) {
-            // Skip length-delimited or fixed fields if ever present.
             if (wire == 2) {
                 uint32_t len = 0;
                 if (!readVarint(&p, end, len) || p + len > end)
@@ -148,6 +215,46 @@ bool decodeMessage(const uint8_t *in, size_t inLen, Message &out)
             break;
         case TAG_ERROR_CODE:
             out.error_code = static_cast<ErrorCode>(value);
+            break;
+        case TAG_DEVICE_ROLE:
+            out.device_role = static_cast<DeviceRole>(value);
+            out.has_device_role = true;
+            break;
+        case TAG_RIDER_NODE_ID:
+            out.rider_node_id = value;
+            out.has_rider_node_id = true;
+            break;
+        case TAG_BOARD_ARMED:
+            out.board_armed = value != 0;
+            out.has_board_armed = true;
+            break;
+        case TAG_BOARD_STATE:
+            out.board_state = static_cast<BoardState>(value);
+            out.has_board_state = true;
+            break;
+        case TAG_SYNCHRONIZED:
+            out.synchronized = value != 0;
+            out.has_synchronized = true;
+            break;
+        case TAG_CONSECUTIVE_MISSED:
+            out.consecutive_missed_bursts = value;
+            out.has_consecutive_missed_bursts = true;
+            break;
+        case TAG_LAST_RIDER_RSSI:
+            out.last_rider_rssi = zigzagDecode(value);
+            out.has_last_rider_rssi = true;
+            break;
+        case TAG_LAST_RIDER_SEEN_AGE:
+            out.last_rider_seen_age_seconds = value;
+            out.has_last_rider_seen_age_seconds = true;
+            break;
+        case TAG_GPS_TRACKING_ACTIVE:
+            out.gps_tracking_active = value != 0;
+            out.has_gps_tracking_active = true;
+            break;
+        case TAG_LAST_GPS_REPORT_STATUS:
+            out.last_gps_report_status = static_cast<GpsReportStatus>(value);
+            out.has_last_gps_report_status = true;
             break;
         default:
             break;
