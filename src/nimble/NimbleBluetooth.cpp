@@ -52,6 +52,20 @@ NimBLEServer *bleServer;
 static bool passkeyShowing;
 static std::atomic<uint16_t> nimbleBluetoothConnHandle{BLE_HS_CONN_HANDLE_NONE}; // BLE_HS_CONN_HANDLE_NONE means "no connection"
 
+static void clearPairingDisplay()
+{
+    if (!passkeyShowing) {
+        return;
+    }
+
+    passkeyShowing = false;
+#if HAS_SCREEN
+    if (screen) {
+        screen->endAlert();
+    }
+#endif
+}
+
 class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 {
     /*
@@ -596,7 +610,7 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
                 display->setTextAlignment(TEXT_ALIGN_CENTER);
                 display->setFont(FONT_MEDIUM);
                 display->drawString(x_offset + x, y_offset + y, "Bluetooth");
-#if !defined(M5STACK_UNITC6L)
+#if !defined(OLED_TINY)
                 display->setFont(FONT_SMALL);
                 y_offset = display->height() == 64 ? y_offset + FONT_HEIGHT_MEDIUM - 4 : y_offset + FONT_HEIGHT_MEDIUM + 5;
                 display->drawString(x_offset + x, y_offset + y, "Enter this code");
@@ -630,13 +644,7 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
 
         meshtastic::BluetoothStatus newStatus(meshtastic::BluetoothStatus::ConnectionState::CONNECTED);
         bluetoothStatus->updateStatus(&newStatus);
-
-        // Todo: migrate this display code back into Screen class, and observe bluetoothStatus
-        if (passkeyShowing) {
-            passkeyShowing = false;
-            if (screen)
-                screen->endAlert();
-        }
+        clearPairingDisplay();
 
         // Store the connection handle for future use
 #ifdef NIMBLE_TWO
@@ -686,10 +694,14 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
 #ifdef NIMBLE_TWO
         if (ble->isDeInit)
             return;
+#else
+        if (nimbleBluetooth && nimbleBluetooth->isDeInit)
+            return;
 #endif
 
         meshtastic::BluetoothStatus newStatus(meshtastic::BluetoothStatus::ConnectionState::DISCONNECTED);
         bluetoothStatus->updateStatus(&newStatus);
+        clearPairingDisplay();
 
         if (bluetoothPhoneAPI) {
             bluetoothPhoneAPI->close();
@@ -754,11 +766,7 @@ void NimbleBluetooth::deinit()
     isDeInit = true;
 
 #ifdef BLE_LED
-#ifdef BLE_LED_INVERTED
-    digitalWrite(BLE_LED, HIGH);
-#else
-    digitalWrite(BLE_LED, LOW);
-#endif
+    digitalWrite(BLE_LED, LED_STATE_OFF);
 #endif
 #ifndef NIMBLE_TWO
     NimBLEDevice::deinit();

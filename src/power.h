@@ -81,7 +81,7 @@ extern RAK9154Sensor rak9154Sensor;
 extern XPowersLibInterface *PMU;
 #endif
 
-class Power : private concurrency::OSThread
+class Power : public concurrency::OSThread
 {
 
   public:
@@ -96,6 +96,14 @@ class Power : private concurrency::OSThread
     void setStatusHandler(meshtastic::PowerStatus *handler) { statusHandler = handler; }
     const uint16_t OCV[11] = {OCV_ARRAY};
 
+#ifdef ARCH_ESP32
+    int beforeLightSleep(void *unused);
+    int afterLightSleep(esp_sleep_wakeup_cause_t cause);
+#endif
+
+    void attachPowerInterrupts();
+    void detachPowerInterrupts();
+
   protected:
     meshtastic::PowerStatus *statusHandler;
 
@@ -103,8 +111,10 @@ class Power : private concurrency::OSThread
     bool axpChipInit();
     /// Setup a simple ADC input based battery sensor
     bool analogInit();
-    /// Setup a Lipo battery level sensor
-    bool lipoInit();
+    /// Setup cw2015 battery level sensor
+    bool cw2015Init();
+    /// Setup a 17048 battery level sensor
+    bool max17048Init();
     /// Setup a Lipo charger
     bool lipoChargerInit();
     /// Setup a meshSolar battery sensor
@@ -118,6 +128,14 @@ class Power : private concurrency::OSThread
     // open circuit voltage lookup table
     uint8_t low_voltage_counter;
     uint32_t lastLogTime = 0;
+
+#ifdef ARCH_ESP32
+    // Get notified when lightsleep begins and ends
+    CallbackObserver<Power, void *> lsObserver = CallbackObserver<Power, void *>(this, &Power::beforeLightSleep);
+    CallbackObserver<Power, esp_sleep_wakeup_cause_t> lsEndObserver =
+        CallbackObserver<Power, esp_sleep_wakeup_cause_t>(this, &Power::afterLightSleep);
+#endif
+
 #ifdef DEBUG_HEAP
     uint32_t lastheap;
 #endif

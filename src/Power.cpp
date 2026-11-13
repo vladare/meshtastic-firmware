@@ -23,6 +23,7 @@
 #include "main.h"
 #include "meshUtils.h"
 #include "power/PowerHAL.h"
+#include "power/SGM41562.h"
 #include "sleep.h"
 
 #if defined(ARCH_PORTDUINO)
@@ -33,6 +34,11 @@
 // Working USB detection for powered/charging states on the RAK platform
 #ifdef NRF_APM
 #include "nrfx_power.h"
+#endif
+
+#if defined(ARCH_NRF52)
+#include "Nrf52SaadcLock.h"
+#include "concurrency/LockGuard.h"
 #endif
 
 #if defined(DEBUG_HEAP_MQTT) && !MESHTASTIC_EXCLUDE_MQTT
@@ -328,6 +334,9 @@ class AnalogBatteryLevel : public HasBatteryLevel
             scaled = esp_adc_cal_raw_to_voltage(raw, adc_characs);
             scaled *= operativeAdcMultiplier;
 #else // block for all other platforms
+#ifdef ARCH_NRF52
+            concurrency::LockGuard saadcGuard(concurrency::nrf52SaadcLock);
+#endif
             for (uint32_t i = 0; i < BATTERY_SENSE_SAMPLES; i++) {
                 raw += analogRead(BATTERY_PIN);
             }
@@ -445,6 +454,10 @@ class AnalogBatteryLevel : public HasBatteryLevel
     /// source
     virtual bool isVbusIn() override
     {
+#ifdef HAS_SGM41562
+        if (sgm41562 && sgm41562->refresh())
+            return sgm41562->isInputPowerGood();
+#endif
 #ifdef EXT_PWR_DETECT
 #if defined(HELTEC_CAPSULE_SENSOR_V3) || defined(HELTEC_SENSOR_HUB)
         // if external powered that pin will be pulled down
@@ -459,6 +472,8 @@ class AnalogBatteryLevel : public HasBatteryLevel
         }
         // if it's not HIGH - check the battery
 #endif
+        // If we have an EXT_PWR_DETECT pin and it indicates no external power, believe it.
+        return false;
 
 // technically speaking this should work for all(?) NRF52 boards
 // but needs testing across multiple devices. NRF52 USB would not even work if
@@ -473,6 +488,10 @@ class AnalogBatteryLevel : public HasBatteryLevel
     /// we can't be smart enough to say 'full'?
     virtual bool isCharging() override
     {
+#ifdef HAS_SGM41562
+        if (sgm41562 && sgm41562->refresh())
+            return sgm41562->isCharging();
+#endif
 #if HAS_TELEMETRY && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR && defined(HAS_RAKPROT) && !defined(HAS_PMU)
         if (hasRAK()) {
             return (rak9154Sensor.isCharging()) ? OptTrue : OptFalse;
@@ -687,10 +706,18 @@ bool Power::analogInit()
  */
 bool Power::setup()
 {
+#ifdef HAS_SGM41562
+    // Initialize the charger early so AnalogBatteryLevel can read charging
+    // state from it. The charger does not provide battery voltage / percent —
+    // those still come from the platform ADC via analogInit() below.
+    initSGM41562(SGM41562_WIRE);
+#endif
     bool found = false;
     if (axpChipInit()) {
         found = true;
-    } else if (lipoInit()) {
+    } else if (cw2015Init()) {
+        found = true;
+    } else if (max17048Init()) {
         found = true;
     } else if (lipoChargerInit()) {
         found = true;
@@ -700,41 +727,21 @@ bool Power::setup()
         found = true;
     } else if (analogInit()) {
         found = true;
-    }
-
+    } else {
 #ifdef NRF_APM
-    found = true;
+        found = true;
 #endif
-#ifdef EXT_PWR_DETECT
-    attachInterrupt(
-        EXT_PWR_DETECT,
-        []() {
-            power->setIntervalFromNow(0);
-            runASAP = true;
-        },
-        CHANGE);
-#endif
-#ifdef BATTERY_CHARGING_INV
-    attachInterrupt(
-        BATTERY_CHARGING_INV,
-        []() {
-            power->setIntervalFromNow(0);
-            runASAP = true;
-        },
-        CHANGE);
-#endif
-#ifdef EXT_CHRG_DETECT
-    attachInterrupt(
-        EXT_CHRG_DETECT,
-        []() {
-            power->setIntervalFromNow(0);
-            runASAP = true;
-            BaseType_t higherWake = 0;
-        },
-        CHANGE);
-#endif
+    }
+    attachPowerInterrupts();
     enabled = found;
     low_voltage_counter = 0;
+
+#ifdef ARCH_ESP32
+    // Register callbacks for before and after lightsleep
+    // Used to detach and reattach interrupts
+    lsObserver.observe(&notifyLightSleep);
+    lsEndObserver.observe(&notifyLightSleepEnd);
+#endif
 
     return found;
 }
@@ -763,8 +770,10 @@ void Power::reboot()
     rp2040.reboot();
 #elif defined(ARCH_PORTDUINO)
     deInitApiServer();
+#ifdef __linux__
     if (aLinuxInputImpl)
         aLinuxInputImpl->deInit();
+#endif
     SPI.end();
     Wire.end();
     Serial1.end();
@@ -817,6 +826,9 @@ void Power::shutdown()
 #ifdef PIN_LED3
     ledOff(PIN_LED3);
 #endif
+#ifdef LED_NOTIFICATION
+    ledOff(LED_NOTIFICATION);
+#endif
     doDeepSleep(DELAY_FOREVER, true, true);
 #elif defined(ARCH_PORTDUINO)
     exit(EXIT_SUCCESS);
@@ -839,8 +851,10 @@ void Power::readPowerStatus()
 
     if (batteryLevel) {
         hasBattery = batteryLevel->isBatteryConnect() ? OptTrue : OptFalse;
+#ifndef NRF_APM
         usbPowered = batteryLevel->isVbusIn() ? OptTrue : OptFalse;
         isChargingNow = batteryLevel->isCharging() ? OptTrue : OptFalse;
+#endif
         if (hasBattery) {
             batteryVoltageMv = batteryLevel->getBattVoltage();
             // If the AXP192 returns a valid battery percentage, use it
@@ -879,7 +893,16 @@ void Power::readPowerStatus()
 
     // Notify any status instances that are observing us
     const PowerStatus powerStatus2 = PowerStatus(hasBattery, usbPowered, isChargingNow, batteryVoltageMv, batteryChargePercent);
-    if (millis() > lastLogTime + 50 * 1000) {
+
+    // Log battery-presence transitions once; skip OptUnknown so we don't lie before the first probe.
+    static OptionalBool prevHasBattery = OptUnknown;
+    if (hasBattery != OptUnknown && hasBattery != prevHasBattery) {
+        LOG_INFO("Power: battery hardware %s", hasBattery == OptTrue ? "detected" : "absent (USB-only)");
+        prevHasBattery = hasBattery;
+    }
+
+    // Periodic telemetry only emits when a battery is actually present (otherwise values are constant -1/0).
+    if (hasBattery == OptTrue && !Throttle::isWithinTimespanMs(lastLogTime, 50 * 1000)) {
         LOG_DEBUG("Battery: usbPower=%d, isCharging=%d, batMv=%d, batPct=%d", powerStatus2.getHasUSB(),
                   powerStatus2.getIsCharging(), powerStatus2.getBatteryVoltageMv(), powerStatus2.getBatteryChargePercent());
         lastLogTime = millis();
@@ -1007,6 +1030,97 @@ int32_t Power::runOnce()
     // Only read once every 20 seconds once the power status for the app has been
     // initialized
     return (statusHandler && statusHandler->isInitialized()) ? (1000 * 20) : RUN_SAME;
+}
+
+#ifdef ARCH_ESP32
+
+// Detach our class' interrupts before lightsleep
+// Allows sleep.cpp to configure its own interrupts, which wake the device on user-button press
+int Power::beforeLightSleep(void *unused)
+{
+    LOG_WARN("Detaching power interrupts for sleep");
+    detachPowerInterrupts();
+    return 0; // Indicates success
+}
+
+// Reconfigure our interrupts
+// Our class' interrupts were disconnected during sleep, to allow the user button to wake the device from sleep
+int Power::afterLightSleep(esp_sleep_wakeup_cause_t cause)
+{
+    attachPowerInterrupts();
+    return 0; // Indicates success
+}
+
+#endif
+
+/*
+ * Attach (or re-attach) hardware interrupts for power management
+ * Public method. Used outside class when waking from MCU sleep
+ */
+void Power::attachPowerInterrupts()
+{
+#ifdef EXT_PWR_DETECT
+    attachInterrupt(
+        EXT_PWR_DETECT,
+        []() {
+            power->setIntervalFromNow(0);
+            runASAP = true;
+        },
+        CHANGE);
+#endif
+#ifdef BATTERY_CHARGING_INV
+    attachInterrupt(
+        BATTERY_CHARGING_INV,
+        []() {
+            power->setIntervalFromNow(0);
+            runASAP = true;
+        },
+        CHANGE);
+#endif
+#ifdef EXT_CHRG_DETECT
+    attachInterrupt(
+        EXT_CHRG_DETECT,
+        []() {
+            power->setIntervalFromNow(0);
+            runASAP = true;
+            BaseType_t higherWake = 0;
+        },
+        CHANGE);
+#endif
+#ifdef PMU_IRQ
+    if (PMU) {
+        attachInterrupt(
+            PMU_IRQ,
+            [] {
+                pmu_irq = true;
+                power->setIntervalFromNow(0);
+                runASAP = true;
+            },
+            FALLING);
+    }
+#endif
+}
+
+/*
+ * Detach the "normal" button interrupts.
+ * Public method. Used before attaching a "wake-on-button" interrupt for MCU sleep
+ */
+void Power::detachPowerInterrupts()
+{
+#ifdef EXT_PWR_DETECT
+    detachInterrupt(EXT_PWR_DETECT);
+#endif
+#ifdef BATTERY_CHARGING_INV
+    detachInterrupt(BATTERY_CHARGING_INV);
+#endif
+#ifdef EXT_CHRG_DETECT
+    detachInterrupt(EXT_CHRG_DETECT);
+#endif
+#ifdef PMU_IRQ
+    if (PMU) {
+        detachInterrupt(PMU_IRQ);
+    }
+#endif
 }
 
 /**
@@ -1286,8 +1400,6 @@ bool Power::axpChipInit()
     }
 
     pinMode(PMU_IRQ, INPUT);
-    attachInterrupt(
-        PMU_IRQ, [] { pmu_irq = true; }, FALLING);
 
     // we do not look for AXPXXX_CHARGING_FINISHED_IRQ & AXPXXX_CHARGING_IRQ
     // because it occurs repeatedly while there is no battery also it could cause
@@ -1316,7 +1428,7 @@ bool Power::axpChipInit()
 /**
  * Wrapper class for an I2C MAX17048 Lipo battery sensor.
  */
-class LipoBatteryLevel : public HasBatteryLevel
+class MAX17048BatteryLevel : public HasBatteryLevel
 {
   private:
     MAX17048Singleton *max17048 = nullptr;
@@ -1364,18 +1476,18 @@ class LipoBatteryLevel : public HasBatteryLevel
     virtual bool isCharging() override { return max17048->isBatteryCharging(); }
 };
 
-LipoBatteryLevel lipoLevel;
+MAX17048BatteryLevel max17048Level;
 
 /**
  * Init the Lipo battery level sensor
  */
-bool Power::lipoInit()
+bool Power::max17048Init()
 {
-    bool result = lipoLevel.runOnce();
-    LOG_DEBUG("Power::lipoInit lipo sensor is %s", result ? "ready" : "not ready yet");
+    bool result = max17048Level.runOnce();
+    LOG_DEBUG("Power::max17048Init lipo sensor is %s", result ? "ready" : "not ready yet");
     if (!result)
         return false;
-    batteryLevel = &lipoLevel;
+    batteryLevel = &max17048Level;
     return true;
 }
 
@@ -1383,7 +1495,88 @@ bool Power::lipoInit()
 /**
  * The Lipo battery level sensor is unavailable - default to AnalogBatteryLevel
  */
-bool Power::lipoInit()
+bool Power::max17048Init()
+{
+    return false;
+}
+#endif
+
+#if !MESHTASTIC_EXCLUDE_I2C && HAS_CW2015
+
+class CW2015BatteryLevel : public AnalogBatteryLevel
+{
+  public:
+    /**
+     * Battery state of charge, from 0 to 100 or -1 for unknown
+     */
+    virtual int getBatteryPercent() override
+    {
+        int data = -1;
+        Wire.beginTransmission(CW2015_ADDR);
+        Wire.write(0x04);
+        if (Wire.endTransmission() == 0) {
+            if (Wire.requestFrom(CW2015_ADDR, (uint8_t)1)) {
+                data = Wire.read();
+            }
+        }
+        return data;
+    }
+
+    /**
+     * The raw voltage of the battery in millivolts, or NAN if unknown
+     */
+    virtual uint16_t getBattVoltage() override
+    {
+        uint16_t mv = 0;
+        Wire.beginTransmission(CW2015_ADDR);
+        Wire.write(0x02);
+        if (Wire.endTransmission() == 0) {
+            if (Wire.requestFrom(CW2015_ADDR, (uint8_t)2)) {
+                mv = Wire.read();
+                mv <<= 8;
+                mv |= Wire.read();
+                // Voltage is read in  305uV units, convert to mV
+                mv = mv * 305 / 1000;
+            }
+        }
+        return mv;
+    }
+};
+
+CW2015BatteryLevel cw2015Level;
+
+/**
+ * Init the CW2015 battery level sensor
+ */
+bool Power::cw2015Init()
+{
+
+    Wire.beginTransmission(CW2015_ADDR);
+    uint8_t getInfo[] = {0x0a, 0x00};
+    Wire.write(getInfo, 2);
+    Wire.endTransmission();
+    delay(10);
+    Wire.beginTransmission(CW2015_ADDR);
+    Wire.write(0x00);
+    bool result = false;
+    if (Wire.endTransmission() == 0) {
+        if (Wire.requestFrom(CW2015_ADDR, (uint8_t)1)) {
+            uint8_t data = Wire.read();
+            LOG_DEBUG("CW2015 init read data: 0x%x", data);
+            if (data == 0x73) {
+                result = true;
+                batteryLevel = &cw2015Level;
+            }
+        }
+    }
+    return result;
+}
+
+#else
+/**
+ * The CW2015 battery level sensor is unavailable - default to AnalogBatteryLevel
+ */
+bool Power::cw2015Init()
 {
     return false;
 }

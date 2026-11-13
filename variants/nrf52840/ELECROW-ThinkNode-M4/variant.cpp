@@ -32,11 +32,11 @@ const uint32_t g_ADigitalPinMap[] = {
 
 void initVariant()
 {
-    pinMode(PIN_LED2, OUTPUT);
-    ledOff(PIN_LED2);
-
     pinMode(LED_PAIRING, OUTPUT);
     ledOff(LED_PAIRING);
+
+    pinMode(LED_HEARTBEAT, OUTPUT);
+    ledOff(LED_HEARTBEAT);
 
     pinMode(Battery_LED_1, OUTPUT);
     ledOff(Battery_LED_1);

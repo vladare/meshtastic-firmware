@@ -143,6 +143,10 @@ int32_t ButtonThread::runOnce()
         leadUpSequenceActive = false;
         resetLeadUpSequence();
     }
+#ifdef INPUT_DEBUG
+    if (buttonCurrentlyPressed)
+        LOG_WARN("Button held for %u ms", millis() - buttonPressStartTime);
+#endif
 
     // Progressive lead-up sound system
     if (!_suppressLeadUp && buttonCurrentlyPressed && (millis() - buttonPressStartTime) >= BUTTON_LEADUP_MS) {
@@ -275,8 +279,8 @@ int32_t ButtonThread::runOnce()
             break;
         } // end multipress event
 
-            // Do actual shutdown when button released, otherwise the button release
-        // may wake the board immediatedly.
+        // Do actual shutdown when button released, otherwise the button release
+        // may wake the board immediately.
         case BUTTON_EVENT_LONG_RELEASED: {
             uint32_t durationMs = (uint32_t)(millis() - buttonPressStartTime);
             uint32_t longMs = (uint32_t)_longPressTime;
@@ -287,7 +291,7 @@ int32_t ButtonThread::runOnce()
 #if defined(TRACKER_T1000_E)
             // T1000-E: long and long-long are mutually exclusive, decided only on release by duration.
             // Shutdown only when duration >= longLongMs and lead-up done. Otherwise SOS when duration >= longMs.
-            if (longLongMs > 0 && durationMs >= longLongMs && millis() > 30000 && _longLongPress != INPUT_BROKER_NONE &&
+            if (longLongMs > 0 && durationMs >= longLongMs && millis() > 30000 && buttonPressStartTime > 30000 && _longLongPress != INPUT_BROKER_NONE &&
                 leadUpPlayed) {
                 evt.inputEvent = _longLongPress;
                 this->notifyObservers(&evt);
@@ -297,7 +301,7 @@ int32_t ButtonThread::runOnce()
                 LOG_DEBUG("T1000-E: SOS sent on release (duration %lu ms)", (unsigned long)durationMs);
             }
 #else
-            if (millis() > 30000 && _longLongPress != INPUT_BROKER_NONE &&
+            if (millis() > 30000 && buttonPressStartTime > 30000 && _longLongPress != INPUT_BROKER_NONE &&
                 durationMs >= longLongMs && leadUpPlayed) {
                 evt.inputEvent = _longLongPress;
                 this->notifyObservers(&evt);
@@ -332,7 +336,8 @@ int32_t ButtonThread::runOnce()
 void ButtonThread::attachButtonInterrupts()
 {
     // Interrupt for user button, during normal use. Improves responsiveness.
-    attachInterrupt(_pinNum, _intRoutine, CHANGE);
+    if (_intRoutine != nullptr)
+        attachInterrupt(_pinNum, _intRoutine, CHANGE);
 }
 
 /*
@@ -341,7 +346,8 @@ void ButtonThread::attachButtonInterrupts()
  */
 void ButtonThread::detachButtonInterrupts()
 {
-    detachInterrupt(_pinNum);
+    if (_intRoutine != nullptr)
+        detachInterrupt(_pinNum);
 }
 
 #ifdef ARCH_ESP32

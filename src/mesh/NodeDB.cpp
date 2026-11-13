@@ -9,6 +9,7 @@
 #include "FSCommon.h"
 #include "MeshRadio.h"
 #include "MeshService.h"
+#include "MessageStore.h"
 #include "NodeDB.h"
 #include "PacketHistory.h"
 #include "PowerFSM.h"
@@ -17,6 +18,7 @@
 #include "Router.h"
 #include "SPILock.h"
 #include "SafeFile.h"
+#include "TransmitHistory.h"
 #include "TypeConversions.h"
 #include "error.h"
 #include "main.h"
@@ -78,6 +80,14 @@ static unsigned char userprefs_admin_key_1[] = USERPREFS_USE_ADMIN_KEY_1;
 #ifdef USERPREFS_USE_ADMIN_KEY_2
 static unsigned char userprefs_admin_key_2[] = USERPREFS_USE_ADMIN_KEY_2;
 #endif
+
+// Weak empty variant initialization function.
+// May be redefined by variant files.
+void variantDefaultConfig() __attribute__((weak));
+void variantDefaultConfig() {}
+
+void variantDefaultModuleConfig() __attribute__((weak));
+void variantDefaultModuleConfig() {}
 
 #ifdef HELTEC_MESH_NODE_T114
 
@@ -143,9 +153,8 @@ uint32_t get_st7789_id(uint8_t cs, uint8_t sck, uint8_t mosi, uint8_t dc, uint8_
     digitalWrite(rst, HIGH);
     delay(10);
 
-    uint32_t ID = 0;
-    ID = readwrite8(0x04, 24, 1, cs, sck, mosi, dc, rst);
-    ID = readwrite8(0x04, 24, 1, cs, sck, mosi, dc, rst); // ST7789 needs twice
+    readwrite8(0x04, 24, 1, cs, sck, mosi, dc, rst);
+    uint32_t ID = readwrite8(0x04, 24, 1, cs, sck, mosi, dc, rst); // ST7789 needs twice
     return ID;
 }
 
@@ -322,10 +331,10 @@ NodeDB::NodeDB()
     // Uncomment below to always enable UDP broadcasts
     // config.network.enabled_protocols = meshtastic_Config_NetworkConfig_ProtocolFlags_UDP_BROADCAST;
 
-    // If we are setup to broadcast on the default channel, ensure that the telemetry intervals are coerced to the minimum value
-    // of 30 minutes or more
-    if (channels.isDefaultChannel(channels.getPrimaryIndex())) {
-        LOG_DEBUG("Coerce telemetry to min of 30 minutes on defaults");
+    // If we are setup to broadcast on any default channel slot (with default frequency slot semantics),
+    // ensure that the telemetry intervals are coerced to the role-aware minimum value.
+    if (channels.hasDefaultChannel()) {
+        LOG_DEBUG("Coerce telemetry to role-aware minimum on defaults");
         moduleConfig.telemetry.device_update_interval = Default::getConfiguredOrMinimumValue(
             moduleConfig.telemetry.device_update_interval, min_default_telemetry_interval_secs);
         moduleConfig.telemetry.environment_update_interval = Default::getConfiguredOrMinimumValue(
@@ -348,7 +357,7 @@ NodeDB::NodeDB()
         }
     }
     if (positionUsesDefaultChannel) {
-        LOG_DEBUG("Coerce position broadcasts to min of 1 hour and smart broadcast min of 5 minutes on defaults");
+        LOG_DEBUG("Coerce position broadcasts to role-aware minimum and smart broadcast min of 5 minutes on defaults");
         config.position.position_broadcast_secs =
             Default::getConfiguredOrMinimumValue(config.position.position_broadcast_secs, min_default_broadcast_interval_secs);
         config.position.broadcast_smart_minimum_interval_secs = Default::getConfiguredOrMinimumValue(
@@ -510,6 +519,15 @@ bool NodeDB::factoryReset(bool eraseBleBonds)
     }
 #endif
     spiLock->unlock();
+
+    // rmDir above nuked the .dat file, but TransmitHistory's in-memory
+    // cache auto-flushes every 5 min and would resurrect it.
+    if (transmitHistory) {
+        transmitHistory->clear();
+    }
+#if HAS_SCREEN
+    messageStore.clearAllMessages();
+#endif
     // second, install default state (this will deal with the duplicate mac address issue)
     installDefaultNodeDatabase();
     installDefaultDeviceState();
@@ -569,9 +587,18 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
         true; // FIXME: maybe false in the future, and setting region to enable it. (unset region forces it off)
     config.lora.override_duty_cycle = false;
     config.lora.config_ok_to_mqtt = false;
+#if HAS_LORA_FEM
+    config.lora.fem_lna_mode = meshtastic_Config_LoRaConfig_FEM_LNA_Mode_ENABLED;
+#else
+    config.lora.fem_lna_mode = meshtastic_Config_LoRaConfig_FEM_LNA_Mode_NOT_PRESENT;
+#endif
 
 #if HAS_TFT // For the devices that support MUI, default to that
     config.display.displaymode = meshtastic_Config_DisplayConfig_DisplayMode_COLOR;
+#endif
+
+#if defined(TFT_WIDTH) && defined(TFT_HEIGHT) && (TFT_WIDTH >= 200 || TFT_HEIGHT >= 200)
+    config.display.enable_message_bubbles = true;
 #endif
 
 #ifdef USERPREFS_CONFIG_DEVICE_ROLE
@@ -664,7 +691,8 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
 #endif
     config.position.broadcast_smart_minimum_distance = 100;
     config.position.broadcast_smart_minimum_interval_secs = default_broadcast_smart_minimum_interval_secs;
-    if (config.device.role != meshtastic_Config_DeviceConfig_Role_ROUTER)
+    if (config.device.role != meshtastic_Config_DeviceConfig_Role_ROUTER &&
+        config.device.role != meshtastic_Config_DeviceConfig_Role_ROUTER_LATE)
         config.device.node_info_broadcast_secs = default_node_info_broadcast_secs;
     config.security.serial_enabled = true;
     config.security.admin_channel_enabled = false;
@@ -672,7 +700,7 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
     strncpy(config.network.ntp_server, "meshtastic.pool.ntp.org", 32);
 
 #if (defined(T_DECK) || defined(T_WATCH_S3) || defined(UNPHONE) || defined(PICOMPUTER_S3) || defined(SENSECAP_INDICATOR) ||      \
-     defined(ELECROW_PANEL) || defined(HELTEC_V4_TFT)) &&                                                                        \
+     defined(ELECROW_PANEL) || defined(HELTEC_V4_TFT) || defined(HELTEC_V4_R8_TFT)) &&                                           \
     HAS_TFT
     // switch BT off by default; use TFT programming mode or hotkey to enable
     config.bluetooth.enabled = false;
@@ -769,6 +797,8 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
 #endif
 
     initConfigIntervals();
+    variantDefaultConfig();
+    variantDefaultModuleConfig();
 }
 
 void NodeDB::initConfigIntervals()
@@ -810,32 +840,29 @@ void NodeDB::installDefaultModuleConfig()
     moduleConfig.has_store_forward = true;
     moduleConfig.has_telemetry = true;
     moduleConfig.has_external_notification = true;
-#if defined(PIN_BUZZER)
+#if defined(PIN_BUZZER) || defined(PIN_VIBRATION) || defined(LED_NOTIFICATION) || defined(PCA_LED_NOTIFICATION) ||               \
+    defined(NEOPIXEL_STATUS_NOTIFICATION_PIN)
     moduleConfig.external_notification.enabled = true;
+#endif
+#if defined(PIN_BUZZER)
     moduleConfig.external_notification.output_buzzer = PIN_BUZZER;
     moduleConfig.external_notification.use_pwm = true;
     moduleConfig.external_notification.alert_message_buzzer = true;
-    moduleConfig.external_notification.nag_timeout = default_ringtone_nag_secs;
 #endif
 #if defined(PIN_VIBRATION)
-    moduleConfig.external_notification.enabled = true;
     moduleConfig.external_notification.output_vibra = PIN_VIBRATION;
     moduleConfig.external_notification.alert_message_vibra = true;
     moduleConfig.external_notification.output_ms = 500;
-    moduleConfig.external_notification.nag_timeout = 2;
 #endif
-#if defined(RAK4630) || defined(RAK11310) || defined(RAK3312) || defined(MUZI_BASE) || defined(ELECROW_ThinkNode_M3) ||          \
-    defined(ELECROW_ThinkNode_M4) || defined(ELECROW_ThinkNode_M6)
-    // Default to PIN_LED2 for external notification output (LED color depends on device variant)
-    moduleConfig.external_notification.enabled = true;
-    moduleConfig.external_notification.output = PIN_LED2;
-#if defined(MUZI_BASE) || defined(ELECROW_ThinkNode_M3)
-    moduleConfig.external_notification.active = false;
-#else
-    moduleConfig.external_notification.active = true;
-#endif
+#if defined(LED_NOTIFICATION)
+    moduleConfig.external_notification.output = LED_NOTIFICATION;
+    moduleConfig.external_notification.active = LED_STATE_ON;
     moduleConfig.external_notification.alert_message = true;
     moduleConfig.external_notification.output_ms = 1000;
+#endif
+#if defined(PIN_VIBRATION)
+    moduleConfig.external_notification.nag_timeout = 2;
+#elif defined(PIN_BUZZER) || defined(LED_NOTIFICATION) || defined(NEOPIXEL_STATUS_NOTIFICATION_PIN)
     moduleConfig.external_notification.nag_timeout = default_ringtone_nag_secs;
 #endif
 
@@ -856,15 +883,6 @@ void NodeDB::installDefaultModuleConfig()
     moduleConfig.external_notification.alert_message = true;
     moduleConfig.external_notification.output_ms = 100;
     moduleConfig.external_notification.active = true;
-#endif
-#ifdef ELECROW_ThinkNode_M1
-    // Default to Elecrow USER_LED (blue)
-    moduleConfig.external_notification.enabled = true;
-    moduleConfig.external_notification.output = USER_LED;
-    moduleConfig.external_notification.active = true;
-    moduleConfig.external_notification.alert_message = true;
-    moduleConfig.external_notification.output_ms = 1000;
-    moduleConfig.external_notification.nag_timeout = 60;
 #endif
 #ifdef T_LORA_PAGER
     moduleConfig.canned_message.updown1_enabled = true;
@@ -1202,11 +1220,11 @@ void NodeDB::loadFromDisk()
     spiLock->unlock();
 #endif
 #ifdef FSCom
-#ifdef FACTORY_INSTALL
+#if defined(FACTORY_INSTALL) && !defined(ARCH_PORTDUINO)
     spiLock->lock();
     if (!FSCom.exists("/prefs/" xstr(BUILD_EPOCH))) {
         LOG_WARN("Factory Install Reset!");
-        FSCom.format();
+        rmDir("/prefs");
         FSCom.mkdir("/prefs");
         File f2 = FSCom.open("/prefs/" xstr(BUILD_EPOCH), FILE_O_WRITE);
         if (f2) {
@@ -1305,6 +1323,10 @@ void NodeDB::loadFromDisk()
     if (config.has_lora && config.lora.use_preset) {
         RadioInterface::bootstrapLoRaConfigFromPreset(config.lora);
     }
+
+#if defined(USERPREFS_LORA_TX_DISABLED) && USERPREFS_LORA_TX_DISABLED
+    config.lora.tx_enabled = false;
+#endif
 
     if (backupSecurity.private_key.size > 0) {
         LOG_DEBUG("Restoring backup of security config");
@@ -1418,6 +1440,15 @@ void NodeDB::loadFromDisk()
     // set any config overrides
     if (portduino_config.has_configDisplayMode) {
         config.display.displaymode = (_meshtastic_Config_DisplayConfig_DisplayMode)portduino_config.configDisplayMode;
+    }
+    if (portduino_config.has_statusMessage) {
+        moduleConfig.has_statusmessage = true;
+        strncpy(moduleConfig.statusmessage.node_status, portduino_config.statusMessage.c_str(),
+                sizeof(moduleConfig.statusmessage.node_status));
+        moduleConfig.statusmessage.node_status[sizeof(moduleConfig.statusmessage.node_status) - 1] = '\0';
+    }
+    if (portduino_config.enable_UDP) {
+        config.network.enabled_protocols = meshtastic_Config_NetworkConfig_ProtocolFlags_UDP_BROADCAST;
     }
 
 #endif
@@ -1559,6 +1590,7 @@ bool NodeDB::saveToDiskNoRetry(int saveWhat)
         moduleConfig.has_ambient_lighting = true;
         moduleConfig.has_audio = true;
         moduleConfig.has_paxcounter = true;
+        moduleConfig.has_statusmessage = true;
 
         success &=
             saveProto(moduleConfigFileName, meshtastic_LocalModuleConfig_size, &meshtastic_LocalModuleConfig_msg, &moduleConfig);
@@ -1773,7 +1805,7 @@ void NodeDB::addFromContact(meshtastic_SharedContact contact)
         info->has_device_metrics = false;
         info->has_position = false;
         info->user.public_key.size = 0;
-        info->user.public_key.bytes[0] = 0;
+        memset(info->user.public_key.bytes, 0, sizeof(info->user.public_key.bytes));
     } else {
         /* Clients are sending add_contact before every text message DM (because clients may hold a larger node database with
          * public keys than the radio holds). However, we don't want to update last_heard just because we sent someone a DM!
@@ -2228,8 +2260,8 @@ bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location,
     } else if (location == meshtastic_AdminMessage_BackupLocation_SD) {
         // TODO: After more mainline SD card support
     }
-    return success;
 #endif
+    return success;
 }
 
 /// Record an error that should be reported via analytics
@@ -2247,7 +2279,10 @@ void recordCriticalError(meshtastic_CriticalErrorCode code, uint32_t address, co
 
     // Currently portuino is mostly used for simulation.  Make sure the user notices something really bad happened
 #ifdef ARCH_PORTDUINO
-    LOG_ERROR("A critical failure occurred, portduino is exiting");
-    exit(2);
+    LOG_ERROR("A critical failure occurred");
+    // TODO: Determine if other critical errors should also cause an immediate exit
+    if (code == meshtastic_CriticalErrorCode_FLASH_CORRUPTION_RECOVERABLE ||
+        code == meshtastic_CriticalErrorCode_FLASH_CORRUPTION_UNRECOVERABLE)
+        exit(2);
 #endif
 }

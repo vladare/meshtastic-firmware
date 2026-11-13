@@ -2,11 +2,13 @@
 #if HAS_SCREEN
 #include "CompassRenderer.h"
 #include "GPSStatus.h"
+#include "MeshService.h"
 #include "NodeDB.h"
 #include "NodeListRenderer.h"
 #include "UIRenderer.h"
 #include "airtime.h"
 #include "gps/GeoCoord.h"
+#include "graphics/EmoteRenderer.h"
 #include "graphics/SharedUIDisplay.h"
 #include "graphics/TimeFormatters.h"
 #include "graphics/images.h"
@@ -18,7 +20,7 @@
 
 // External variables
 extern graphics::Screen *screen;
-#if defined(M5STACK_UNITC6L)
+#if defined(OLED_TINY)
 static uint32_t lastSwitchTime = 0;
 #endif
 namespace graphics
@@ -34,6 +36,15 @@ static inline void drawSatelliteIcon(OLEDDisplay *display, int16_t x, int16_t y)
     } else {
         display->drawXbm(x + 1, y + yOffset, imgSatellite_width, imgSatellite_height, imgSatellite);
     }
+}
+
+static void drawCompassStatusText(OLEDDisplay *display, int16_t compassX, int16_t compassY, const char *statusLine1,
+                                  const char *statusLine2)
+{
+    display->setTextAlignment(TEXT_ALIGN_CENTER);
+    display->drawString(compassX, compassY - FONT_HEIGHT_SMALL, statusLine1);
+    display->drawString(compassX, compassY, statusLine2);
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
 }
 
 void graphics::UIRenderer::rebuildFavoritedNodes()
@@ -287,7 +298,8 @@ void UIRenderer::drawNodes(OLEDDisplay *display, int16_t x, int16_t y, const mes
 // **********************
 // * Favorite Node Info *
 // **********************
-void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *state, int16_t x, int16_t y)
+// cppcheck-suppress constParameterPointer; signature must match FrameCallback typedef from OLEDDisplayUi library
+void UIRenderer::drawNodeInfo(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x, int16_t y)
 {
     if (favoritedNodes.empty())
         return;
@@ -301,7 +313,7 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
     if (!node || node->num == nodeDB->getNodeNum() || !node->is_favorite)
         return;
     display->clear();
-#if defined(M5STACK_UNITC6L)
+#if defined(OLED_TINY)
     uint32_t now = millis();
     if (now - lastSwitchTime >= 10000) // 10000 ms = 10 秒
     {
@@ -311,9 +323,9 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
 #endif
     currentFavoriteNodeNum = node->num;
     // === Create the shortName and title string ===
-    const char *shortName = (node->has_user && haveGlyphs(node->user.short_name)) ? node->user.short_name : "Node";
-    char titlestr[32] = {0};
-    snprintf(titlestr, sizeof(titlestr), "Fav: %s", shortName);
+    const char *shortName = (node->has_user && node->user.short_name[0]) ? node->user.short_name : "Node";
+    char titlestr[40];
+    snprintf(titlestr, sizeof(titlestr), "*%s*", shortName);
 
     // === Draw battery/time/mail header (common across screens) ===
     graphics::drawCommonHeader(display, x, y, titlestr);
@@ -326,7 +338,6 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
 
     // List of available macro Y positions in order, from top to bottom.
     int line = 1; // which slot to use next
-    std::string usernameStr;
     // === 1. Long Name (always try to show first) ===
     const char *username;
     if (currentResolution == ScreenResolution::UltraLow) {
@@ -336,40 +347,167 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
     }
 
     if (username) {
-        usernameStr = sanitizeString(username); // Sanitize the incoming long_name just in case
         // Print node's long name (e.g. "Backpack Node")
-        display->drawString(x, getTextPositions(display)[line++], usernameStr.c_str());
+        UIRenderer::drawStringWithEmotes(display, x, getTextPositions(display)[line++], username, FONT_HEIGHT_SMALL, 1, false);
     }
 
     // === 2. Signal and Hops (combined on one line, if available) ===
-    // If both are present: "Sig: 97%  [2hops]"
-    // If only one: show only that one
     char signalHopsStr[32] = "";
     bool haveSignal = false;
-    int percentSignal = clamp((int)((node->snr + 10) * 5), 0, 100);
+    int bars = 0;
 
-    // Always use "Sig" for the label
-    const char *signalLabel = " Sig";
+    // Helper to get SNR limit based on modem preset
+    auto getSnrLimit = [](meshtastic_Config_LoRaConfig_ModemPreset preset) -> float {
+        switch (preset) {
+        case meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW:
+        case meshtastic_Config_LoRaConfig_ModemPreset_LONG_MODERATE:
+        case meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST:
+            return -6.0f;
+        case meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_SLOW:
+        case meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST:
+            return -5.5f;
+        case meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW:
+        case meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST:
+        case meshtastic_Config_LoRaConfig_ModemPreset_SHORT_TURBO:
+            return -4.5f;
+        default:
+            return -6.0f;
+        }
+    };
+
+    // Calculate signal grade using modem preset and SNR only
+    float snrLimit = getSnrLimit(config.lora.modem_preset);
+    float snr = node->snr;
+
+    // Determine signal quality label and bars using SNR-only grading
+    const char *qualityLabel = nullptr;
+
+    if (snr > snrLimit + 10) {
+        qualityLabel = "Good";
+        bars = 4;
+    } else if (snr > snrLimit + 6) {
+        qualityLabel = "Good";
+        bars = 3;
+    } else if (snr > snrLimit + 2) {
+        qualityLabel = "Good";
+        bars = 2;
+    } else if (snr > snrLimit - 4) {
+        qualityLabel = "Fair";
+        bars = 1;
+    } else {
+        qualityLabel = "Bad";
+        bars = 1;
+    }
+
+    // Add extra spacing on the left if we have an API connection to account for the common footer icons
+    const char *leftSideSpacing =
+        graphics::isAPIConnected(service->api_state) ? (currentResolution == ScreenResolution::High ? "     " : "   ") : " ";
 
     // --- Build the Signal/Hops line ---
-    // If SNR looks reasonable, show signal
-    if ((int)((node->snr + 10) * 5) >= 0 && node->snr > -100) {
-        snprintf(signalHopsStr, sizeof(signalHopsStr), "%s: %d%%", signalLabel, percentSignal);
+    // Only show signal if we have valid SNR
+    if (snr > -100 && snr != 0) {
+        snprintf(signalHopsStr, sizeof(signalHopsStr), "%sSig:%s", leftSideSpacing, qualityLabel);
         haveSignal = true;
     }
-    // If hops is valid (>0), show right after signal
+
     if (node->hops_away > 0) {
         size_t len = strlen(signalHopsStr);
-        // Decide between "1 Hop" and "N Hops"
         if (haveSignal) {
-            snprintf(signalHopsStr + len, sizeof(signalHopsStr) - len, " [%d %s]", node->hops_away,
-                     (node->hops_away == 1 ? "Hop" : "Hops"));
+            snprintf(signalHopsStr + len, sizeof(signalHopsStr) - len, " [#]");
         } else {
-            snprintf(signalHopsStr, sizeof(signalHopsStr), "[%d %s]", node->hops_away, (node->hops_away == 1 ? "Hop" : "Hops"));
+            snprintf(signalHopsStr, sizeof(signalHopsStr), "[#]");
         }
     }
-    if (signalHopsStr[0] && line < 5) {
-        display->drawString(x, getTextPositions(display)[line++], signalHopsStr);
+
+    if (signalHopsStr[0]) {
+        int yPos = getTextPositions(display)[line++];
+        int curX = x;
+
+        // Split combined string into signal text and hop suffix
+        char sigPart[20] = "";
+        const char *hopPart = nullptr;
+
+        char *bracket = strchr(signalHopsStr, '[');
+        if (bracket) {
+            size_t n = (size_t)(bracket - signalHopsStr);
+            if (n >= sizeof(sigPart))
+                n = sizeof(sigPart) - 1;
+            memcpy(sigPart, signalHopsStr, n);
+            sigPart[n] = '\0';
+
+            // Trim trailing spaces
+            while (strlen(sigPart) && sigPart[strlen(sigPart) - 1] == ' ') {
+                sigPart[strlen(sigPart) - 1] = '\0';
+            }
+
+            hopPart = bracket; // "[n Hop(s)]"
+        } else {
+            strncpy(sigPart, signalHopsStr, sizeof(sigPart) - 1);
+            sigPart[sizeof(sigPart) - 1] = '\0';
+        }
+
+        // Draw signal quality text
+        display->drawString(curX, yPos, sigPart);
+        curX += display->getStringWidth(sigPart) + 4;
+
+        // Draw signal bars (skip on UltraLow, text only)
+        if (currentResolution != ScreenResolution::UltraLow && haveSignal && bars > 0) {
+            const int kMaxBars = 4;
+            if (bars < 1)
+                bars = 1;
+            if (bars > kMaxBars)
+                bars = kMaxBars;
+
+            int barX = curX;
+
+            const bool hi = (currentResolution == ScreenResolution::High);
+            int barWidth = hi ? 2 : 1;
+            int barGap = hi ? 2 : 1;
+            int maxBarHeight = FONT_HEIGHT_SMALL - 7;
+            if (!hi)
+                maxBarHeight -= 1;
+            int barY = yPos + (FONT_HEIGHT_SMALL - maxBarHeight) / 2;
+
+            for (int bi = 0; bi < kMaxBars; bi++) {
+                int barHeight = maxBarHeight * (bi + 1) / kMaxBars;
+                if (barHeight < 2)
+                    barHeight = 2;
+
+                int bx = barX + bi * (barWidth + barGap);
+                int by = barY + maxBarHeight - barHeight;
+
+                if (bi < bars) {
+                    display->fillRect(bx, by, barWidth, barHeight);
+                } else {
+                    int baseY = barY + maxBarHeight - 1;
+                    display->drawHorizontalLine(bx, baseY, barWidth);
+                }
+            }
+
+            curX += (kMaxBars * barWidth) + ((kMaxBars - 1) * barGap) + 2;
+        }
+
+        // Draw hops AFTER the bars as: [ number + hop icon ]
+        if (hopPart && node->hops_away > 0) {
+
+            // open bracket
+            display->drawString(curX, yPos, "[");
+            curX += display->getStringWidth("[") + 1;
+
+            // hop count
+            char hopCount[6];
+            snprintf(hopCount, sizeof(hopCount), "%d", node->hops_away);
+            display->drawString(curX, yPos, hopCount);
+            curX += display->getStringWidth(hopCount) + 2;
+
+            // hop icon
+            const int iconY = yPos + (FONT_HEIGHT_SMALL - hop_height) / 2;
+            display->drawXbm(curX, iconY, hop_width, hop_height, hop);
+            curX += hop_width + 1;
+
+            // closing bracket
+            display->drawString(curX, yPos, "]");
+        }
     }
 
     // === 3. Heard (last seen, skip if node never seen) ===
@@ -377,8 +515,8 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
     uint32_t seconds = sinceLastSeen(node);
     if (seconds != 0 && seconds != UINT32_MAX) {
         uint32_t minutes = seconds / 60, hours = minutes / 60, days = hours / 24;
-        // Format as "Heard: Xm ago", "Heard: Xh ago", or "Heard: Xd ago"
-        snprintf(seenStr, sizeof(seenStr), (days > 365 ? " Heard: ?" : " Heard: %d%c ago"),
+        // Format as "Heard:Xm ago", "Heard:Xh ago", or "Heard:Xd ago"
+        snprintf(seenStr, sizeof(seenStr), (days > 365 ? " Heard:?" : "%sHeard:%d%c ago"), leftSideSpacing,
                  (days    ? days
                   : hours ? hours
                           : minutes),
@@ -386,16 +524,18 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
                   : hours ? 'h'
                           : 'm'));
     }
-    if (seenStr[0] && line < 5) {
+    if (seenStr[0]) {
         display->drawString(x, getTextPositions(display)[line++], seenStr);
     }
-#if !defined(M5STACK_UNITC6L)
+#if !defined(OLED_TINY)
     // === 4. Uptime (only show if metric is present) ===
     char uptimeStr[32] = "";
     if (node->has_device_metrics && node->device_metrics.has_uptime_seconds) {
-        getUptimeStr(node->device_metrics.uptime_seconds * 1000, " Up", uptimeStr, sizeof(uptimeStr));
+        char upPrefix[12]; // enough for leftSideSpacing + "Up:"
+        snprintf(upPrefix, sizeof(upPrefix), "%sUp:", leftSideSpacing);
+        getUptimeStr(node->device_metrics.uptime_seconds * 1000, upPrefix, uptimeStr, sizeof(uptimeStr));
     }
-    if (uptimeStr[0] && line < 5) {
+    if (uptimeStr[0]) {
         display->drawString(x, getTextPositions(display)[line++], uptimeStr);
     }
 
@@ -422,16 +562,16 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
             if (miles < 0.1) {
                 int feet = (int)(miles * 5280);
                 if (feet > 0 && feet < 1000) {
-                    snprintf(distStr, sizeof(distStr), " Distance: %dft", feet);
+                    snprintf(distStr, sizeof(distStr), "%sDistance:%dft", leftSideSpacing, feet);
                     haveDistance = true;
                 } else if (feet >= 1000) {
-                    snprintf(distStr, sizeof(distStr), " Distance: ¼mi");
+                    snprintf(distStr, sizeof(distStr), "%sDistance:¼mi", leftSideSpacing);
                     haveDistance = true;
                 }
             } else {
                 int roundedMiles = (int)(miles + 0.5);
                 if (roundedMiles > 0 && roundedMiles < 1000) {
-                    snprintf(distStr, sizeof(distStr), " Distance: %dmi", roundedMiles);
+                    snprintf(distStr, sizeof(distStr), "%sDistance:%dmi", leftSideSpacing, roundedMiles);
                     haveDistance = true;
                 }
             }
@@ -439,71 +579,122 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
             if (distanceKm < 1.0) {
                 int meters = (int)(distanceKm * 1000);
                 if (meters > 0 && meters < 1000) {
-                    snprintf(distStr, sizeof(distStr), " Distance: %dm", meters);
+                    snprintf(distStr, sizeof(distStr), "%sDistance:%dm", leftSideSpacing, meters);
                     haveDistance = true;
                 } else if (meters >= 1000) {
-                    snprintf(distStr, sizeof(distStr), " Distance: 1km");
+                    snprintf(distStr, sizeof(distStr), "%sDistance:1km", leftSideSpacing);
                     haveDistance = true;
                 }
             } else {
                 int km = (int)(distanceKm + 0.5);
                 if (km > 0 && km < 1000) {
-                    snprintf(distStr, sizeof(distStr), " Distance: %dkm", km);
+                    snprintf(distStr, sizeof(distStr), "%sDistance:%dkm", leftSideSpacing, km);
                     haveDistance = true;
                 }
             }
         }
     }
-    // Only display if we actually have a value!
-    if (haveDistance && distStr[0] && line < 5) {
+    if (haveDistance && distStr[0]) {
         display->drawString(x, getTextPositions(display)[line++], distStr);
+    }
+
+    // === 6. Battery after Distance line, otherwise next available line ===
+    char batLine[32] = "";
+    bool haveBatLine = false;
+
+    if (node->has_device_metrics) {
+        bool hasPct = node->device_metrics.has_battery_level;
+        bool hasVolt = node->device_metrics.has_voltage && node->device_metrics.voltage > 0.001f;
+
+        int pct = 0;
+        float volt = 0.0f;
+
+        if (hasPct) {
+            pct = (int)node->device_metrics.battery_level;
+        }
+
+        if (hasVolt) {
+            volt = node->device_metrics.voltage;
+        }
+
+        if (hasPct && pct > 0 && pct <= 100) {
+            // Normal battery percentage
+            if (hasVolt) {
+                snprintf(batLine, sizeof(batLine), "%sBat:%d%% (%.2fV)", leftSideSpacing, pct, volt);
+            } else {
+                snprintf(batLine, sizeof(batLine), "%sBat:%d%%", leftSideSpacing, pct);
+            }
+            haveBatLine = true;
+        } else if (hasPct && pct > 100) {
+            // Plugged in
+            if (hasVolt) {
+                snprintf(batLine, sizeof(batLine), "%sPlugged In (%.2fV)", leftSideSpacing, volt);
+            } else {
+                snprintf(batLine, sizeof(batLine), "%sPlugged In", leftSideSpacing);
+            }
+            haveBatLine = true;
+        } else if (!hasPct && hasVolt) {
+            // Voltage only
+            snprintf(batLine, sizeof(batLine), "%sBat:%.2fV", leftSideSpacing, volt);
+            haveBatLine = true;
+        }
+    }
+
+    const int maxTextLines = (currentResolution == ScreenResolution::High) ? 6 : 5;
+
+    // Only draw battery if it fits within the allowed lines
+    if (haveBatLine && line <= maxTextLines) {
+        display->drawString(x, getTextPositions(display)[line++], batLine);
+    }
+
+    bool showCompass = false;
+    float myHeading = 0.0f;
+    float bearing = 0.0f;
+    const bool hasOwnPositionFix = (ourNode && nodeDB->hasValidPosition(ourNode));
+    const bool hasNodePositionFix = nodeDB->hasValidPosition(node);
+    const char *statusLine1 = nullptr;
+    const char *statusLine2 = nullptr;
+    if (hasOwnPositionFix && hasNodePositionFix) {
+        const auto &op = ourNode->position;
+        showCompass = CompassRenderer::getHeadingRadians(DegD(op.latitude_i), DegD(op.longitude_i), myHeading);
+        if (showCompass) {
+            const auto &p = node->position;
+            bearing = GeoCoord::bearing(DegD(op.latitude_i), DegD(op.longitude_i), DegD(p.latitude_i), DegD(p.longitude_i));
+            bearing = CompassRenderer::adjustBearingForCompassMode(bearing, myHeading);
+        } else {
+            statusLine1 = "No";
+            statusLine2 = "Heading";
+        }
+    } else if (!hasOwnPositionFix || !hasNodePositionFix) {
+        statusLine1 = "No";
+        statusLine2 = "Fix";
     }
 
     // --- Compass Rendering: landscape (wide) screens use the original side-aligned logic ---
     if (SCREEN_WIDTH > SCREEN_HEIGHT) {
-        bool showCompass = false;
-        if (ourNode && (nodeDB->hasValidPosition(ourNode) || screen->hasHeading()) && nodeDB->hasValidPosition(node)) {
-            showCompass = true;
-        }
-        if (showCompass) {
+        if (showCompass || statusLine1) {
             const int16_t topY = getTextPositions(display)[1];
             const int16_t bottomY = SCREEN_HEIGHT - (FONT_HEIGHT_SMALL - 1);
             const int16_t usableHeight = bottomY - topY - 5;
             int16_t compassRadius = usableHeight / 2;
             if (compassRadius < 8)
                 compassRadius = 8;
-            const int16_t compassDiam = compassRadius * 2;
             const int16_t compassX = x + SCREEN_WIDTH - compassRadius - 8;
             const int16_t compassY = topY + (usableHeight / 2) + ((FONT_HEIGHT_SMALL - 1) / 2) + 2;
-
-            const auto &op = ourNode->position;
-            float myHeading = screen->hasHeading() ? screen->getHeading() * PI / 180
-                                                   : screen->estimatedHeading(DegD(op.latitude_i), DegD(op.longitude_i));
-
-            const auto &p = node->position;
-            /* unused
-            float d =
-                GeoCoord::latLongToMeter(DegD(p.latitude_i), DegD(p.longitude_i), DegD(op.latitude_i), DegD(op.longitude_i));
-            */
-            float bearing = GeoCoord::bearing(DegD(op.latitude_i), DegD(op.longitude_i), DegD(p.latitude_i), DegD(p.longitude_i));
-            if (uiconfig.compass_mode == meshtastic_CompassMode_FREEZE_HEADING) {
-                myHeading = 0;
-            } else {
-                bearing -= myHeading;
-            }
+            const int16_t compassDiam = compassRadius * 2;
 
             display->drawCircle(compassX, compassY, compassRadius);
-            CompassRenderer::drawCompassNorth(display, compassX, compassY, myHeading, compassRadius);
-            CompassRenderer::drawNodeHeading(display, compassX, compassY, compassDiam, bearing);
+            if (showCompass) {
+                CompassRenderer::drawCompassNorth(display, compassX, compassY, myHeading, compassRadius);
+                CompassRenderer::drawNodeHeading(display, compassX, compassY, compassDiam, bearing);
+            } else {
+                drawCompassStatusText(display, compassX, compassY, statusLine1, statusLine2);
+            }
         }
         // else show nothing
     } else {
         // Portrait or square: put compass at the bottom and centered, scaled to fit available space
-        bool showCompass = false;
-        if (ourNode && (nodeDB->hasValidPosition(ourNode) || screen->hasHeading()) && nodeDB->hasValidPosition(node)) {
-            showCompass = true;
-        }
-        if (showCompass) {
+        if (showCompass || statusLine1) {
             int yBelowContent = (line > 0 && line <= 5) ? (getTextPositions(display)[line - 1] + FONT_HEIGHT_SMALL + 2)
                                                         : getTextPositions(display)[1];
             const int margin = 4;
@@ -514,8 +705,8 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
 #else
             const int navBarHeight = 0;
 #endif
-            int availableHeight = SCREEN_HEIGHT - yBelowContent - navBarHeight - margin;
             // --------- END PATCH FOR EINK NAV BAR -----------
+            int availableHeight = SCREEN_HEIGHT - yBelowContent - navBarHeight - margin;
 
             if (availableHeight < FONT_HEIGHT_SMALL * 2)
                 return;
@@ -529,25 +720,13 @@ void UIRenderer::drawNodeInfo(OLEDDisplay *display, const OLEDDisplayUiState *st
             int compassX = x + SCREEN_WIDTH / 2;
             int compassY = yBelowContent + availableHeight / 2;
 
-            const auto &op = ourNode->position;
-            float myHeading = 0;
-            if (uiconfig.compass_mode != meshtastic_CompassMode_FREEZE_HEADING) {
-                myHeading = screen->hasHeading() ? screen->getHeading() * PI / 180
-                                                 : screen->estimatedHeading(DegD(op.latitude_i), DegD(op.longitude_i));
-            }
-            graphics::CompassRenderer::drawCompassNorth(display, compassX, compassY, myHeading, compassRadius);
-
-            const auto &p = node->position;
-            /* unused
-            float d =
-                GeoCoord::latLongToMeter(DegD(p.latitude_i), DegD(p.longitude_i), DegD(op.latitude_i), DegD(op.longitude_i));
-            */
-            float bearing = GeoCoord::bearing(DegD(op.latitude_i), DegD(op.longitude_i), DegD(p.latitude_i), DegD(p.longitude_i));
-            if (uiconfig.compass_mode != meshtastic_CompassMode_FREEZE_HEADING)
-                bearing -= myHeading;
-            graphics::CompassRenderer::drawNodeHeading(display, compassX, compassY, compassRadius * 2, bearing);
-
             display->drawCircle(compassX, compassY, compassRadius);
+            if (showCompass) {
+                graphics::CompassRenderer::drawCompassNorth(display, compassX, compassY, myHeading, compassRadius);
+                graphics::CompassRenderer::drawNodeHeading(display, compassX, compassY, compassRadius * 2, bearing);
+            } else {
+                drawCompassStatusText(display, compassX, compassY, statusLine1, statusLine2);
+            }
         }
         // else show nothing
     }
@@ -593,7 +772,7 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
     }
     char uptimeStr[32] = "";
     if (currentResolution != ScreenResolution::UltraLow) {
-        getUptimeStr(millis(), "Up", uptimeStr, sizeof(uptimeStr));
+        getUptimeStr(millis(), "Up: ", uptimeStr, sizeof(uptimeStr));
     }
     display->drawString(SCREEN_WIDTH - display->getStringWidth(uptimeStr), getTextPositions(display)[line++], uptimeStr);
 
@@ -616,20 +795,18 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
     }
 #endif
 
-#if defined(M5STACK_UNITC6L)
+#if defined(OLED_TINY)
     line += 1;
 
     // === Node Identity ===
     int textWidth = 0;
     int nameX = 0;
-    char shortnameble[35];
-    snprintf(shortnameble, sizeof(shortnameble), "%s",
-             graphics::UIRenderer::haveGlyphs(owner.short_name) ? owner.short_name : "");
+    const char *shortName = owner.short_name ? owner.short_name : "";
 
     // === ShortName Centered ===
-    textWidth = display->getStringWidth(shortnameble);
+    textWidth = UIRenderer::measureStringWithEmotes(display, shortName);
     nameX = (SCREEN_WIDTH - textWidth) / 2;
-    display->drawString(nameX, getTextPositions(display)[line++], shortnameble);
+    UIRenderer::drawStringWithEmotes(display, nameX, getTextPositions(display)[line++], shortName, FONT_HEIGHT_SMALL, 1, false);
 #else
     if (powerStatus->getHasBattery()) {
         char batStr[20];
@@ -724,36 +901,36 @@ void UIRenderer::drawDeviceFocused(OLEDDisplay *display, OLEDDisplayUiState *sta
     int textWidth = 0;
     int nameX = 0;
     int yOffset = (currentResolution == ScreenResolution::High) ? 0 : 5;
-    std::string longNameStr;
-
-    if (ourNode && ourNode->has_user && strlen(ourNode->user.long_name) > 0) {
-        longNameStr = sanitizeString(ourNode->user.long_name);
+    const char *longName = (ourNode && ourNode->has_user && ourNode->user.long_name[0]) ? ourNode->user.long_name : "";
+    const char *shortName = owner.short_name ? owner.short_name : "";
+    char combinedName[96];
+    if (longName[0] && shortName[0]) {
+        snprintf(combinedName, sizeof(combinedName), "%s (%s)", longName, shortName);
+    } else if (longName[0]) {
+        strncpy(combinedName, longName, sizeof(combinedName) - 1);
+        combinedName[sizeof(combinedName) - 1] = '\0';
+    } else {
+        strncpy(combinedName, shortName, sizeof(combinedName) - 1);
+        combinedName[sizeof(combinedName) - 1] = '\0';
     }
-    char shortnameble[35];
-    snprintf(shortnameble, sizeof(shortnameble), "%s",
-             graphics::UIRenderer::haveGlyphs(owner.short_name) ? owner.short_name : "");
-
-    char combinedName[50];
-    snprintf(combinedName, sizeof(combinedName), "%s (%s)", longNameStr.empty() ? "" : longNameStr.c_str(), shortnameble);
-    if (SCREEN_WIDTH - (display->getStringWidth(combinedName)) > 10) {
-        size_t len = strlen(combinedName);
-        if (len >= 3 && strcmp(combinedName + len - 3, " ()") == 0) {
-            combinedName[len - 3] = '\0'; // Remove the last three characters
-        }
-        textWidth = display->getStringWidth(combinedName);
+    if (SCREEN_WIDTH - UIRenderer::measureStringWithEmotes(display, combinedName) > 10) {
+        textWidth = UIRenderer::measureStringWithEmotes(display, combinedName);
         nameX = (SCREEN_WIDTH - textWidth) / 2;
-        display->drawString(
-            nameX, ((rows == 4) ? getTextPositions(display)[line++] : getTextPositions(display)[line++]) + yOffset, combinedName);
+        UIRenderer::drawStringWithEmotes(
+            display, nameX, ((rows == 4) ? getTextPositions(display)[line++] : getTextPositions(display)[line++]) + yOffset,
+            combinedName, FONT_HEIGHT_SMALL, 1, false);
     } else {
         // === LongName Centered ===
-        textWidth = display->getStringWidth(longNameStr.c_str());
+        textWidth = UIRenderer::measureStringWithEmotes(display, longName);
         nameX = (SCREEN_WIDTH - textWidth) / 2;
-        display->drawString(nameX, getTextPositions(display)[line++], longNameStr.c_str());
+        UIRenderer::drawStringWithEmotes(display, nameX, getTextPositions(display)[line++], longName, FONT_HEIGHT_SMALL, 1,
+                                         false);
 
         // === ShortName Centered ===
-        textWidth = display->getStringWidth(shortnameble);
+        textWidth = UIRenderer::measureStringWithEmotes(display, shortName);
         nameX = (SCREEN_WIDTH - textWidth) / 2;
-        display->drawString(nameX, getTextPositions(display)[line++], shortnameble);
+        UIRenderer::drawStringWithEmotes(display, nameX, getTextPositions(display)[line++], shortName, FONT_HEIGHT_SMALL, 1,
+                                         false);
     }
 #endif
     graphics::drawCommonFooter(display, x, y);
@@ -865,12 +1042,12 @@ void UIRenderer::drawScreensaverOverlay(OLEDDisplay *display, OLEDDisplayUiState
     display->setTextAlignment(TEXT_ALIGN_LEFT);
     const char *pauseText = "Screen Paused";
     const char *idText = owner.short_name;
-    const bool useId = haveGlyphs(idText);
+    const bool useId = (idText && idText[0]);
     constexpr uint8_t padding = 2;
     constexpr uint8_t dividerGap = 1;
 
     // Text widths
-    const uint16_t idTextWidth = display->getStringWidth(idText, strlen(idText), true);
+    const uint16_t idTextWidth = useId ? UIRenderer::measureStringWithEmotes(display, idText) : 0;
     const uint16_t pauseTextWidth = display->getStringWidth(pauseText, strlen(pauseText));
     const uint16_t boxWidth = padding + (useId ? idTextWidth + padding : 0) + pauseTextWidth + padding;
     const uint16_t boxHeight = FONT_HEIGHT_SMALL + (padding * 2);
@@ -895,7 +1072,7 @@ void UIRenderer::drawScreensaverOverlay(OLEDDisplay *display, OLEDDisplayUiState
 
     // Draw: text
     if (useId)
-        display->drawString(idTextLeft, idTextTop, idText);
+        UIRenderer::drawStringWithEmotes(display, idTextLeft, idTextTop, idText, FONT_HEIGHT_SMALL, 1, false);
     display->drawString(pauseTextLeft, pauseTextTop, pauseText);
     display->drawString(pauseTextLeft + 1, pauseTextTop, pauseText); // Faux bold
 
@@ -915,7 +1092,7 @@ void UIRenderer::drawIconScreen(const char *upperMsg, OLEDDisplay *display, OLED
     // needs to be drawn relative to x and y
 
     // draw centered icon left to right and centered above the one line of app text
-#if defined(M5STACK_UNITC6L)
+#if defined(OLED_TINY)
     display->drawXbm(x + (SCREEN_WIDTH - 50) / 2, y + (SCREEN_HEIGHT - 28) / 2, icon_width, icon_height, icon_bits);
     display->setFont(FONT_MEDIUM);
     display->setTextAlignment(TEXT_ALIGN_LEFT);
@@ -928,11 +1105,16 @@ void UIRenderer::drawIconScreen(const char *upperMsg, OLEDDisplay *display, OLED
         display->drawString(msgX, msgY, upperMsg);
     }
     // Draw version and short name in bottom middle
-    char buf[25];
-    snprintf(buf, sizeof(buf), "%s   %s", xstr(APP_VERSION_SHORT),
-             graphics::UIRenderer::haveGlyphs(owner.short_name) ? owner.short_name : "");
-
-    display->drawString(x + getStringCenteredX(buf), y + SCREEN_HEIGHT - FONT_HEIGHT_MEDIUM, buf);
+    char footer[64];
+    if (owner.short_name && owner.short_name[0]) {
+        snprintf(footer, sizeof(footer), "%s   %s", xstr(APP_VERSION_SHORT), owner.short_name);
+    } else {
+        snprintf(footer, sizeof(footer), "%s", xstr(APP_VERSION_SHORT));
+    }
+    int footerW = UIRenderer::measureStringWithEmotes(display, footer);
+    int footerX = x + ((SCREEN_WIDTH - footerW) / 2);
+    UIRenderer::drawStringWithEmotes(display, footerX, y + SCREEN_HEIGHT - FONT_HEIGHT_MEDIUM, footer, FONT_HEIGHT_SMALL, 1,
+                                     false);
     screen->forceDisplay();
 
     display->setTextAlignment(TEXT_ALIGN_LEFT); // Restore left align, just to be kind to any other unsuspecting code
@@ -950,12 +1132,15 @@ void UIRenderer::drawIconScreen(const char *upperMsg, OLEDDisplay *display, OLED
         display->drawString(x + 0, y + 0, upperMsg);
 
     // Draw version and short name in upper right
-    char buf[25];
-    snprintf(buf, sizeof(buf), "%s\n%s", xstr(APP_VERSION_SHORT),
-             graphics::UIRenderer::haveGlyphs(owner.short_name) ? owner.short_name : "");
-
-    display->setTextAlignment(TEXT_ALIGN_RIGHT);
-    display->drawString(x + SCREEN_WIDTH, y + 0, buf);
+    const char *version = xstr(APP_VERSION_SHORT);
+    int versionX = x + SCREEN_WIDTH - display->getStringWidth(version);
+    display->drawString(versionX, y + 0, version);
+    if (owner.short_name && owner.short_name[0]) {
+        const char *shortName = owner.short_name;
+        int shortNameW = UIRenderer::measureStringWithEmotes(display, shortName);
+        int shortNameX = x + SCREEN_WIDTH - shortNameW;
+        UIRenderer::drawStringWithEmotes(display, shortNameX, y + FONT_HEIGHT_SMALL, shortName, FONT_HEIGHT_SMALL, 1, false);
+    }
     screen->forceDisplay();
 
     display->setTextAlignment(TEXT_ALIGN_LEFT); // Restore left align, just to be kind to any other unsuspecting code
@@ -977,6 +1162,7 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
 
     // === Header ===
     graphics::drawCommonHeader(display, x, y, titleStr);
+    const int *textPos = getTextPositions(display);
 
     // === First Row: My Location ===
 #if HAS_GPS
@@ -984,7 +1170,6 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
     config.display.heading_bold = false;
 
     const char *displayLine = ""; // Initialize to empty string by default
-    meshtastic_NodeInfoLite *ourNode = nodeDB->getMeshNode(nodeDB->getNodeNum());
 
     if (config.position.gps_mode != meshtastic_Config_PositionConfig_GpsMode_ENABLED) {
         if (config.position.fixed_position) {
@@ -992,12 +1177,12 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
         } else {
             displayLine = config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_NOT_PRESENT ? "No GPS" : "GPS off";
         }
-        drawSatelliteIcon(display, x, getTextPositions(display)[line]);
+        drawSatelliteIcon(display, x, textPos[line]);
         int xOffset = (currentResolution == ScreenResolution::High) ? 6 : 0;
-        display->drawString(x + 11 + xOffset, getTextPositions(display)[line++], displayLine);
+        display->drawString(x + 11 + xOffset, textPos[line++], displayLine);
     } else {
         // Onboard GPS
-        UIRenderer::drawGps(display, 0, getTextPositions(display)[line++], gpsStatus);
+        UIRenderer::drawGps(display, 0, textPos[line++], gpsStatus);
     }
 
     config.display.heading_bold = origBold;
@@ -1006,18 +1191,36 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
     geoCoord.updateCoords(int32_t(gpsStatus->getLatitude()), int32_t(gpsStatus->getLongitude()),
                           int32_t(gpsStatus->getAltitude()));
 
-    // === Determine Compass Heading ===
-    float heading = 0;
+    meshtastic_NodeInfoLite *ourNode = nodeDB->getMeshNode(nodeDB->getNodeNum());
+    const bool hasOwnPositionFix = (ourNode && nodeDB->hasValidPosition(ourNode));
+    const bool hasLiveGpsFix =
+        (gpsStatus && gpsStatus->getHasLock() && (gpsStatus->getLatitude() != 0 || gpsStatus->getLongitude() != 0));
+    const bool hasSensorHeading = screen->hasHeading();
+    float heading = 0.0f;
     bool validHeading = false;
-    if (uiconfig.compass_mode == meshtastic_CompassMode_FREEZE_HEADING) {
-        validHeading = true;
-    } else {
-        if (screen->hasHeading()) {
-            heading = radians(screen->getHeading());
-            validHeading = true;
+    const char *statusLine1 = nullptr;
+    const char *statusLine2 = nullptr;
+    if (hasSensorHeading || hasLiveGpsFix || hasOwnPositionFix) {
+        double headingLat = 0.0;
+        double headingLon = 0.0;
+        if (hasLiveGpsFix) {
+            headingLat = DegD(gpsStatus->getLatitude());
+            headingLon = DegD(gpsStatus->getLongitude());
+        } else if (hasOwnPositionFix) {
+            const auto &op = ourNode->position;
+            headingLat = DegD(op.latitude_i);
+            headingLon = DegD(op.longitude_i);
+        }
+        validHeading = CompassRenderer::getHeadingRadians(headingLat, headingLon, heading);
+    }
+
+    if (!validHeading) {
+        if (hasSensorHeading || hasLiveGpsFix || hasOwnPositionFix) {
+            statusLine1 = "No";
+            statusLine2 = "Heading";
         } else {
-            heading = screen->estimatedHeading(geoCoord.getLatitude() * 1e-7, geoCoord.getLongitude() * 1e-7);
-            validHeading = !isnan(heading);
+            statusLine1 = "No";
+            statusLine2 = "Fix";
         }
     }
 
@@ -1029,24 +1232,24 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
             char uptimeStr[32];
 #if defined(USE_EINK)
             // E-Ink: skip seconds, show only days/hours/mins
-            getUptimeStr(delta, "Last", uptimeStr, sizeof(uptimeStr), false);
+            getUptimeStr(delta, "Last: ", uptimeStr, sizeof(uptimeStr), false);
 #else
             // Non E-Ink: include seconds where useful
-            getUptimeStr(delta, "Last", uptimeStr, sizeof(uptimeStr), true);
+            getUptimeStr(delta, "Last: ", uptimeStr, sizeof(uptimeStr), true);
 #endif
 
-            display->drawString(0, getTextPositions(display)[line++], uptimeStr);
+            display->drawString(0, textPos[line++], uptimeStr);
         } else {
-            display->drawString(0, getTextPositions(display)[line++], "Last: ?");
+            display->drawString(0, textPos[line++], "Last: ?");
         }
 
         // === Third Row: Line 1 GPS Info ===
-        UIRenderer::drawGpsCoordinates(display, x, getTextPositions(display)[line++], gpsStatus, "line1");
+        UIRenderer::drawGpsCoordinates(display, x, textPos[line++], gpsStatus, "line1");
 
         if (uiconfig.gps_format != meshtastic_DeviceUIConfig_GpsCoordinateFormat_OLC &&
             uiconfig.gps_format != meshtastic_DeviceUIConfig_GpsCoordinateFormat_MLS) {
             // === Fourth Row: Line 2 GPS Info ===
-            UIRenderer::drawGpsCoordinates(display, x, getTextPositions(display)[line++], gpsStatus, "line2");
+            UIRenderer::drawGpsCoordinates(display, x, textPos[line++], gpsStatus, "line2");
         }
 
         // === Final Row: Altitude ===
@@ -1057,14 +1260,14 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
         } else {
             snprintf(altitudeLine, sizeof(altitudeLine), "Alt: %.0im", alt);
         }
-        display->drawString(x, getTextPositions(display)[line++], altitudeLine);
+        display->drawString(x, textPos[line++], altitudeLine);
     }
-#if !defined(M5STACK_UNITC6L)
-    // === Draw Compass if heading is valid ===
-    if (validHeading) {
+#if !defined(OLED_TINY)
+    // === Draw Compass ===
+    if (validHeading || statusLine1) {
         // --- Compass Rendering: landscape (wide) screens use original side-aligned logic ---
         if (SCREEN_WIDTH > SCREEN_HEIGHT) {
-            const int16_t topY = getTextPositions(display)[1];
+            const int16_t topY = textPos[1];
             const int16_t bottomY = SCREEN_HEIGHT - (FONT_HEIGHT_SMALL - 1); // nav row height
             const int16_t usableHeight = bottomY - topY - 5;
 
@@ -1077,29 +1280,33 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
             // Center vertically and nudge down slightly to keep "N" clear of header
             const int16_t compassY = topY + (usableHeight / 2) + ((FONT_HEIGHT_SMALL - 1) / 2) + 2;
 
-            CompassRenderer::drawNodeHeading(display, compassX, compassY, compassDiam, -heading);
             display->drawCircle(compassX, compassY, compassRadius);
+            if (validHeading) {
+                CompassRenderer::drawNodeHeading(display, compassX, compassY, compassDiam, -heading);
 
-            // "N" label
-            float northAngle = 0;
-            if (uiconfig.compass_mode != meshtastic_CompassMode_FIXED_RING)
-                northAngle = -heading;
-            float radius = compassRadius;
-            int16_t nX = compassX + (radius - 1) * sin(northAngle);
-            int16_t nY = compassY - (radius - 1) * cos(northAngle);
-            int16_t nLabelWidth = display->getStringWidth("N") + 2;
-            int16_t nLabelHeightBox = FONT_HEIGHT_SMALL + 1;
+                // "N" label
+                float northAngle = 0;
+                if (uiconfig.compass_mode != meshtastic_CompassMode_FIXED_RING)
+                    northAngle = -heading;
+                float radius = compassRadius;
+                int16_t nX = compassX + (radius - 1) * sin(northAngle);
+                int16_t nY = compassY - (radius - 1) * cos(northAngle);
+                int16_t nLabelWidth = display->getStringWidth("N") + 2;
+                int16_t nLabelHeightBox = FONT_HEIGHT_SMALL + 1;
 
-            display->setColor(BLACK);
-            display->fillRect(nX - nLabelWidth / 2, nY - nLabelHeightBox / 2, nLabelWidth, nLabelHeightBox);
-            display->setColor(WHITE);
-            display->setFont(FONT_SMALL);
-            display->setTextAlignment(TEXT_ALIGN_CENTER);
-            display->drawString(nX, nY - FONT_HEIGHT_SMALL / 2, "N");
+                display->setColor(BLACK);
+                display->fillRect(nX - nLabelWidth / 2, nY - nLabelHeightBox / 2, nLabelWidth, nLabelHeightBox);
+                display->setColor(WHITE);
+                display->setFont(FONT_SMALL);
+                display->setTextAlignment(TEXT_ALIGN_CENTER);
+                display->drawString(nX, nY - FONT_HEIGHT_SMALL / 2, "N");
+            } else {
+                drawCompassStatusText(display, compassX, compassY, statusLine1, statusLine2);
+            }
         } else {
             // Portrait or square: put compass at the bottom and centered, scaled to fit available space
             // For E-Ink screens, account for navigation bar at the bottom!
-            int yBelowContent = getTextPositions(display)[5] + FONT_HEIGHT_SMALL + 2;
+            int yBelowContent = textPos[5] + FONT_HEIGHT_SMALL + 2;
             const int margin = 4;
             int availableHeight =
 #if defined(USE_EINK)
@@ -1120,25 +1327,29 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
             int compassX = x + SCREEN_WIDTH / 2;
             int compassY = yBelowContent + availableHeight / 2;
 
-            CompassRenderer::drawNodeHeading(display, compassX, compassY, compassRadius * 2, -heading);
             display->drawCircle(compassX, compassY, compassRadius);
+            if (validHeading) {
+                CompassRenderer::drawNodeHeading(display, compassX, compassY, compassRadius * 2, -heading);
 
-            // "N" label
-            float northAngle = 0;
-            if (uiconfig.compass_mode != meshtastic_CompassMode_FIXED_RING)
-                northAngle = -heading;
-            float radius = compassRadius;
-            int16_t nX = compassX + (radius - 1) * sin(northAngle);
-            int16_t nY = compassY - (radius - 1) * cos(northAngle);
-            int16_t nLabelWidth = display->getStringWidth("N") + 2;
-            int16_t nLabelHeightBox = FONT_HEIGHT_SMALL + 1;
+                // "N" label
+                float northAngle = 0;
+                if (uiconfig.compass_mode != meshtastic_CompassMode_FIXED_RING)
+                    northAngle = -heading;
+                float radius = compassRadius;
+                int16_t nX = compassX + (radius - 1) * sin(northAngle);
+                int16_t nY = compassY - (radius - 1) * cos(northAngle);
+                int16_t nLabelWidth = display->getStringWidth("N") + 2;
+                int16_t nLabelHeightBox = FONT_HEIGHT_SMALL + 1;
 
-            display->setColor(BLACK);
-            display->fillRect(nX - nLabelWidth / 2, nY - nLabelHeightBox / 2, nLabelWidth, nLabelHeightBox);
-            display->setColor(WHITE);
-            display->setFont(FONT_SMALL);
-            display->setTextAlignment(TEXT_ALIGN_CENTER);
-            display->drawString(nX, nY - FONT_HEIGHT_SMALL / 2, "N");
+                display->setColor(BLACK);
+                display->fillRect(nX - nLabelWidth / 2, nY - nLabelHeightBox / 2, nLabelWidth, nLabelHeightBox);
+                display->setColor(WHITE);
+                display->setFont(FONT_SMALL);
+                display->setTextAlignment(TEXT_ALIGN_CENTER);
+                display->drawString(nX, nY - FONT_HEIGHT_SMALL / 2, "N");
+            } else {
+                drawCompassStatusText(display, compassX, compassY, statusLine1, statusLine2);
+            }
         }
     }
 #endif
@@ -1186,11 +1397,15 @@ void UIRenderer::drawOEMIconScreen(const char *upperMsg, OLEDDisplay *display, O
         display->drawString(x + 0, y + 0, upperMsg);
 
     // Draw version and shortname in upper right
-    char buf[25];
-    snprintf(buf, sizeof(buf), "%s\n%s", xstr(APP_VERSION_SHORT), haveGlyphs(owner.short_name) ? owner.short_name : "");
-
-    display->setTextAlignment(TEXT_ALIGN_RIGHT);
-    display->drawString(x + SCREEN_WIDTH, y + 0, buf);
+    const char *version = xstr(APP_VERSION_SHORT);
+    int versionX = x + SCREEN_WIDTH - display->getStringWidth(version);
+    display->drawString(versionX, y + 0, version);
+    if (owner.short_name && owner.short_name[0]) {
+        const char *shortName = owner.short_name;
+        int shortNameW = UIRenderer::measureStringWithEmotes(display, shortName);
+        int shortNameX = x + SCREEN_WIDTH - shortNameW;
+        UIRenderer::drawStringWithEmotes(display, shortNameX, y + FONT_HEIGHT_SMALL, shortName, FONT_HEIGHT_SMALL, 1, false);
+    }
     screen->forceDisplay();
 
     display->setTextAlignment(TEXT_ALIGN_LEFT); // Restore left align, just to be kind to any other unsuspecting code
@@ -1210,6 +1425,7 @@ static int8_t lastFrameIndex = -1;
 static uint32_t lastFrameChangeTime = 0;
 constexpr uint32_t ICON_DISPLAY_DURATION_MS = 2000;
 
+// cppcheck-suppress constParameterPointer; signature must match OverlayCallback typedef from OLEDDisplayUi library
 void UIRenderer::drawNavigationBar(OLEDDisplay *display, OLEDDisplayUiState *state)
 {
     int currentFrame = state->currentFrame;
@@ -1376,6 +1592,25 @@ std::string UIRenderer::drawTimeDelta(uint32_t days, uint32_t hours, uint32_t mi
     else
         uptime = std::to_string(seconds) + "s";
     return uptime;
+}
+
+int UIRenderer::measureStringWithEmotes(OLEDDisplay *display, const char *line, int emoteSpacing)
+{
+    return graphics::EmoteRenderer::measureStringWithEmotes(display, line, graphics::emotes, graphics::numEmotes, emoteSpacing);
+}
+
+size_t UIRenderer::truncateStringWithEmotes(OLEDDisplay *display, const char *line, char *out, size_t outSize, int maxWidth,
+                                            const char *ellipsis, int emoteSpacing)
+{
+    return graphics::EmoteRenderer::truncateToWidth(display, line, out, outSize, maxWidth, ellipsis, graphics::emotes,
+                                                    graphics::numEmotes, emoteSpacing);
+}
+
+void UIRenderer::drawStringWithEmotes(OLEDDisplay *display, int x, int y, const char *line, int fontHeight, int emoteSpacing,
+                                      bool fauxBold)
+{
+    graphics::EmoteRenderer::drawStringWithEmotes(display, x, y, line, fontHeight, graphics::emotes, graphics::numEmotes,
+                                                  emoteSpacing, fauxBold);
 }
 
 } // namespace graphics
