@@ -37,6 +37,9 @@
 #if !MESHTASTIC_EXCLUDE_POWERSTRESS
 #include "modules/PowerStressModule.h"
 #endif
+#if defined(TRACKER_T1000_E)
+#include "modules/BoardFinder/BoardFinderModule.h"
+#endif
 #include "modules/RoutingModule.h"
 #include "modules/TextMessageModule.h"
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
@@ -99,6 +102,9 @@
 #endif
 #if !MESHTASTIC_EXCLUDE_STATUS
 #include "modules/StatusMessageModule.h"
+#endif
+#if defined(TRACKER_T1000_E)
+#include "modules/BoardFinder/BoardFinderModule.h"
 #endif
 
 #if defined(HAS_HARDWARE_WATCHDOG)
@@ -174,6 +180,9 @@ void setupModules()
 #endif
 #if !MESHTASTIC_EXCLUDE_POWERSTRESS
     new PowerStressModule();
+#endif
+#if defined(TRACKER_T1000_E)
+    boardFinderModule = new BoardFinderModule();
 #endif
     // Example: Put your module here
     // new ReplyModule();

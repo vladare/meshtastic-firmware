@@ -7,6 +7,12 @@
 #include "main.h"
 #include "mesh/PhoneAPI.h"
 #include "mesh/mesh-pb-constants.h"
+#if defined(TRACKER_T1000_E)
+#include "T1000eBleBurst.h"
+#include "concurrency/LockGuard.h"
+#include "concurrency/OSThread.h"
+#include "mesh/NodeDB.h"
+#endif
 #include <bluefruit.h>
 #include <utility/bonding.h>
 static BLEService meshBleService = BLEService(BLEUuid(MESH_SERVICE_UUID_16));
@@ -34,6 +40,14 @@ static uint8_t lastToRadio[MAX_TO_FROM_RADIO_SIZE];
 
 static uint16_t connectionHandle;
 static bool passkeyShowing;
+
+#if defined(TRACKER_T1000_E)
+static void t1000eBurstInit();
+static void t1000eBurstOnConnect();
+static void t1000eBurstOnDisconnect();
+static void t1000eBurstSuspend();
+static void t1000eResumeConnectableAdvertising();
+#endif
 
 class BluetoothPhoneAPI : public PhoneAPI
 {
@@ -69,6 +83,9 @@ void onConnect(uint16_t conn_handle)
     // Notify UI (or any other interested firmware components)
     meshtastic::BluetoothStatus newStatus(meshtastic::BluetoothStatus::ConnectionState::CONNECTED);
     bluetoothStatus->updateStatus(&newStatus);
+#if defined(TRACKER_T1000_E)
+    t1000eBurstOnConnect();
+#endif
 }
 /**
  * Callback invoked when a connection is dropped
@@ -97,6 +114,9 @@ void onDisconnect(uint16_t conn_handle, uint8_t reason)
             screen->endAlert();
         }
     }
+#endif
+#if defined(TRACKER_T1000_E)
+    t1000eBurstOnDisconnect();
 #endif
 }
 void onCccd(uint16_t conn_hdl, BLECharacteristic *chr, uint16_t cccd_value)
@@ -229,6 +249,10 @@ void setupMeshService(void)
 static uint32_t configuredPasskey;
 void NRF52Bluetooth::shutdown()
 {
+#if defined(TRACKER_T1000_E)
+    // Stop experimental bursts before the link is torn down. Do not restart advertising afterwards.
+    t1000eBurstSuspend();
+#endif
     // Shutdown bluetooth for minimum power draw
     LOG_INFO("Disable NRF52 bluetooth");
     Bluefruit.Security.setPairPasskeyCallback(NRF52Bluetooth::onUnwantedPairing); // Actively refuse (during factory reset)
@@ -344,13 +368,20 @@ void NRF52Bluetooth::setup()
     LOG_INFO("Set up the advertising payload(s)");
     startAdv();
     LOG_INFO("Advertise");
+#if defined(TRACKER_T1000_E)
+    t1000eBurstInit();
+#endif
 }
 void NRF52Bluetooth::resumeAdvertising()
 {
+#if defined(TRACKER_T1000_E)
+    t1000eResumeConnectableAdvertising();
+#else
     Bluefruit.Advertising.restartOnDisconnect(true);
     Bluefruit.Advertising.setInterval(32, 668); // in unit of 0.625 ms
     Bluefruit.Advertising.setFastTimeout(30);   // number of seconds in fast mode
     Bluefruit.Advertising.start(0);
+#endif
 }
 /// Given a level between 0-100, update the BLE attribute
 void updateBatteryLevel(uint8_t level)
@@ -484,3 +515,295 @@ void NRF52Bluetooth::sendLog(const uint8_t *logMessage, size_t length)
     else
         logRadio.notify(logMessage, (uint16_t)length);
 }
+
+#if defined(TRACKER_T1000_E)
+// Experimental Board Finder beacon for the Rider T1000-E only.
+// While Android is disconnected, startAdv()/resumeAdvertising() keep the stock connectable packet.
+// While Android is connected AND ble_burst_enabled is true, this thread reuses the single S140
+// advertising set for a 3 s non-connectable burst every 60 s (start-to-start), after an initial
+// 15 s delay so Meshtastic GATT sync can finish. SoftDevice is driven directly because
+// Bluefruit.Advertising.start() uses _fast_timeout and always attaches a scan response.
+//
+// Ownership: while connected, restartOnDisconnect(false). The deferred onDisconnect path
+// exclusively restores connectable advertising.
+
+constexpr uint32_t BLE_BURST_PERIOD_MS = 60000;
+constexpr uint32_t BLE_BURST_DURATION_MS = 3000;
+constexpr uint32_t BLE_BURST_INITIAL_DELAY_MS = 15000;
+constexpr uint32_t BLE_ADV_INTERVAL_MS = 100;
+constexpr uint16_t BLE_ADV_INTERVAL_UNITS = static_cast<uint16_t>((BLE_ADV_INTERVAL_MS * 1000U) / 625U);
+static_assert(BLE_ADV_INTERVAL_UNITS == 160, "100 ms must be 160 advertising-interval units");
+
+enum class BurstPhase : uint8_t { Idle, Bursting };
+
+static concurrency::Lock &burstLock()
+{
+    static concurrency::Lock lock;
+    return lock;
+}
+
+static bool bleBurstEnabled = false;
+static bool phoneConnected = false;
+static bool restoreSuppressed = false;
+static BurstPhase phase = BurstPhase::Idle;
+static uint8_t advHandle = 0;
+static uint32_t nextBurstAtMs = 0;
+static uint32_t burstStartedAtMs = 0;
+static uint8_t burstPayload[31];
+static uint8_t burstPayloadLen = 0;
+
+class T1000eBleBurstThread : public concurrency::OSThread
+{
+  public:
+    T1000eBleBurstThread() : concurrency::OSThread("T1000EBurst", 0) {}
+    void wake()
+    {
+        enabled = true;
+        setIntervalFromNow(0);
+    }
+    int32_t runOnce() override;
+};
+
+static T1000eBleBurstThread *burstThread = nullptr;
+
+static int32_t delayUntil(uint32_t targetMs)
+{
+    int32_t remaining = static_cast<int32_t>(targetMs - millis());
+    return remaining > 0 ? remaining : 0;
+}
+
+static void buildBurstPayload(uint32_t nodeId)
+{
+    burstPayload[0] = 2;
+    burstPayload[1] = BLE_GAP_AD_TYPE_FLAGS;
+    burstPayload[2] = BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE;
+    constexpr uint8_t meshUuidLen = 16;
+    burstPayload[3] = 1 + meshUuidLen + sizeof(nodeId);
+    burstPayload[4] = BLE_GAP_AD_TYPE_SERVICE_DATA_128BIT_UUID;
+    memcpy(&burstPayload[5], MESH_SERVICE_UUID_16, meshUuidLen);
+    burstPayload[21] = static_cast<uint8_t>(nodeId);
+    burstPayload[22] = static_cast<uint8_t>(nodeId >> 8);
+    burstPayload[23] = static_cast<uint8_t>(nodeId >> 16);
+    burstPayload[24] = static_cast<uint8_t>(nodeId >> 24);
+    burstPayloadLen = 25;
+}
+
+static uint32_t stopAdvertisingSet()
+{
+    uint32_t err = sd_ble_gap_adv_stop(advHandle);
+    if (err != NRF_SUCCESS && err != NRF_ERROR_INVALID_STATE)
+        LOG_ERROR("[BLE-BURST] Start failed: sd_ble_gap_adv_stop returned 0x%lx", static_cast<unsigned long>(err));
+    return err;
+}
+
+static uint32_t startNonConnectableBurst(uint32_t nodeId)
+{
+    static ble_gap_adv_data_t advData;
+    memset(&advData, 0, sizeof(advData));
+    buildBurstPayload(nodeId);
+    advData.adv_data.p_data = burstPayload;
+    advData.adv_data.len = burstPayloadLen;
+
+    ble_gap_adv_params_t params;
+    memset(&params, 0, sizeof(params));
+    params.properties.type = BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED;
+    params.p_peer_addr = nullptr;
+    params.interval = BLE_ADV_INTERVAL_UNITS;
+    params.duration = BLE_GAP_ADV_TIMEOUT_GENERAL_UNLIMITED;
+    params.max_adv_evts = 0;
+    params.filter_policy = BLE_GAP_ADV_FP_ANY;
+    params.primary_phy = BLE_GAP_PHY_1MBPS;
+    params.secondary_phy = BLE_GAP_PHY_1MBPS;
+
+    uint8_t handle = advHandle;
+    uint32_t err = sd_ble_gap_adv_set_configure(&handle, &advData, &params);
+    if (err == NRF_ERROR_INVALID_STATE) {
+        stopAdvertisingSet();
+        handle = advHandle;
+        err = sd_ble_gap_adv_set_configure(&handle, &advData, &params);
+    }
+    if (err != NRF_SUCCESS)
+        return err;
+    advHandle = handle;
+
+    uint32_t powerErr = sd_ble_gap_tx_power_set(BLE_GAP_TX_POWER_ROLE_ADV, advHandle, Bluefruit.getTxPower());
+    if (powerErr != NRF_SUCCESS)
+        LOG_ERROR("[BLE-BURST] Start failed: sd_ble_gap_tx_power_set returned 0x%lx", static_cast<unsigned long>(powerErr));
+
+    return sd_ble_gap_adv_start(advHandle, BLE_CONN_CFG_TAG_DEFAULT);
+}
+
+static bool restoreConnectableLocked()
+{
+    stopAdvertisingSet();
+    Bluefruit.Advertising.setType(BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED);
+    Bluefruit.Advertising.setInterval(32, 668);
+    Bluefruit.Advertising.setFastTimeout(30);
+    Bluefruit.Advertising.restartOnDisconnect(false);
+    if (Bluefruit.Advertising.start(0)) {
+        Bluefruit.Advertising.restartOnDisconnect(true);
+        return true;
+    }
+    stopAdvertisingSet();
+    if (Bluefruit.Advertising.start(0)) {
+        Bluefruit.Advertising.restartOnDisconnect(true);
+        return true;
+    }
+    return false;
+}
+
+static void stopBurstLocked()
+{
+    uint32_t durationMs = millis() - burstStartedAtMs;
+    stopAdvertisingSet();
+    phase = BurstPhase::Idle;
+    LOG_INFO("[BLE-BURST] Stop t=%u dur=%u", millis(), durationMs);
+}
+
+static void armBurstScheduleLocked()
+{
+    nextBurstAtMs = millis() + BLE_BURST_INITIAL_DELAY_MS;
+    phase = BurstPhase::Idle;
+    if (burstThread != nullptr)
+        burstThread->wake();
+}
+
+static void cancelBurstScheduleLocked()
+{
+    if (phase == BurstPhase::Bursting)
+        stopBurstLocked();
+    else
+        phase = BurstPhase::Idle;
+    if (burstThread != nullptr)
+        burstThread->disable();
+}
+
+int32_t T1000eBleBurstThread::runOnce()
+{
+    concurrency::LockGuard guard(&burstLock());
+
+    if (restoreSuppressed || !config.bluetooth.enabled || !phoneConnected || !bleBurstEnabled) {
+        if (phase == BurstPhase::Bursting)
+            stopBurstLocked();
+        return disable();
+    }
+
+    uint32_t now = millis();
+    if (phase == BurstPhase::Bursting) {
+        stopBurstLocked();
+        return delayUntil(nextBurstAtMs);
+    }
+
+    if (delayUntil(nextBurstAtMs) > 0)
+        return delayUntil(nextBurstAtMs);
+
+    if (nodeDB == nullptr) {
+        LOG_ERROR("[BLE-BURST] Start failed: node database is not ready");
+        nextBurstAtMs = now + BLE_BURST_PERIOD_MS;
+        return static_cast<int32_t>(BLE_BURST_PERIOD_MS);
+    }
+
+    uint32_t nodeId = nodeDB->getNodeNum();
+    uint32_t err = startNonConnectableBurst(nodeId);
+    if (err != NRF_SUCCESS) {
+        LOG_ERROR("[BLE-BURST] Start failed: 0x%lx", static_cast<unsigned long>(err));
+        nextBurstAtMs = now + BLE_BURST_PERIOD_MS;
+        return static_cast<int32_t>(BLE_BURST_PERIOD_MS);
+    }
+
+    phase = BurstPhase::Bursting;
+    burstStartedAtMs = millis();
+    nextBurstAtMs = burstStartedAtMs + BLE_BURST_PERIOD_MS;
+    LOG_INFO("[BLE-BURST] Start t=%u node=0x%08x interval=%ums", burstStartedAtMs, nodeId, BLE_ADV_INTERVAL_MS);
+    return static_cast<int32_t>(BLE_BURST_DURATION_MS);
+}
+
+static void t1000eBurstInit()
+{
+    burstLock();
+    if (burstThread == nullptr)
+        burstThread = new T1000eBleBurstThread();
+}
+
+static void t1000eBurstOnConnect()
+{
+    concurrency::LockGuard guard(&burstLock());
+    if (restoreSuppressed || !config.bluetooth.enabled || burstThread == nullptr)
+        return;
+    Bluefruit.Advertising.restartOnDisconnect(false);
+    phoneConnected = true;
+    LOG_INFO("[BLE-BURST] Connected t=%u enabled=%d", millis(), bleBurstEnabled ? 1 : 0);
+    if (bleBurstEnabled)
+        armBurstScheduleLocked();
+    else
+        cancelBurstScheduleLocked();
+}
+
+static void t1000eBurstOnDisconnect()
+{
+    concurrency::LockGuard guard(&burstLock());
+    phoneConnected = false;
+    LOG_INFO("[BLE-BURST] Disconnected t=%u", millis());
+
+    cancelBurstScheduleLocked();
+
+    if (restoreSuppressed || !config.bluetooth.enabled) {
+        Bluefruit.Advertising.restartOnDisconnect(false);
+        return;
+    }
+
+    if (restoreConnectableLocked())
+        LOG_INFO("[BLE-BURST] Connectable advertising restored t=%u", millis());
+    else
+        LOG_ERROR("[BLE-BURST] Start failed: connectable restart returned false");
+}
+
+static void t1000eBurstSuspend()
+{
+    concurrency::LockGuard guard(&burstLock());
+    restoreSuppressed = true;
+    phoneConnected = false;
+    Bluefruit.Advertising.restartOnDisconnect(false);
+    cancelBurstScheduleLocked();
+}
+
+static void t1000eResumeConnectableAdvertising()
+{
+    concurrency::LockGuard guard(&burstLock());
+    restoreSuppressed = false;
+    if (phoneConnected) {
+        Bluefruit.Advertising.restartOnDisconnect(false);
+        return;
+    }
+    if (!restoreConnectableLocked())
+        LOG_ERROR("[BLE-BURST] Start failed: connectable restart returned false");
+}
+
+void t1000eBurstSetEnabled(bool enabled)
+{
+    concurrency::LockGuard guard(&burstLock());
+    bleBurstEnabled = enabled;
+    LOG_INFO("[BLE-BURST] Enabled=%d", enabled ? 1 : 0);
+}
+
+bool t1000eBurstIsEnabled()
+{
+    concurrency::LockGuard guard(&burstLock());
+    return bleBurstEnabled;
+}
+
+void t1000eBurstReapply()
+{
+    concurrency::LockGuard guard(&burstLock());
+    if (restoreSuppressed || !config.bluetooth.enabled || !phoneConnected || burstThread == nullptr) {
+        cancelBurstScheduleLocked();
+        return;
+    }
+    Bluefruit.Advertising.restartOnDisconnect(false);
+    if (bleBurstEnabled)
+        armBurstScheduleLocked();
+    else
+        cancelBurstScheduleLocked();
+}
+#endif
+
