@@ -8,14 +8,15 @@
 // Official Meshtastic Config/ModuleConfig/AdminMessage protos are not modified.
 //
 // v1 fields 1-6 and commands 0-4 remain stable for Rider advertising control.
-// v2 adds role/board commands and status fields; firmware accepts versions 1..2.
+// v2 adds role/board commands and status fields; firmware accepts versions 1..3.
+// v3 adds GPS Economy Mode configuration and status fields (17-23).
 
 namespace boardfinder
 {
 
-constexpr uint32_t PROTOCOL_VERSION = 2;
+constexpr uint32_t PROTOCOL_VERSION = 3;
 constexpr uint32_t PROTOCOL_VERSION_MIN = 1;
-constexpr size_t MAX_MESSAGE_BYTES = 128;
+constexpr size_t MAX_MESSAGE_BYTES = 192;
 
 enum class Command : uint8_t {
     UNSPECIFIED = 0,
@@ -49,6 +50,7 @@ enum class ErrorCode : uint8_t {
     NOT_BOARD = 7,
     RIDER_UNASSIGNED = 8,
     INVALID_STATE = 9,
+    INVALID_CONFIG = 10,
 };
 
 enum class DeviceRole : uint8_t {
@@ -72,6 +74,12 @@ enum class GpsReportStatus : uint8_t {
     UNAVAILABLE = 2,
     DEFERRED = 3,
     FAILED = 4,
+};
+
+enum class ReportingPhase : uint8_t {
+    INACTIVE = 0,
+    NORMAL = 1,
+    ECONOMY = 2,
 };
 
 struct Message {
@@ -114,6 +122,28 @@ struct Message {
 
     GpsReportStatus last_gps_report_status = GpsReportStatus::NONE;
     bool has_last_gps_report_status = false;
+
+    // v3 Economy configuration / status
+    bool economy_enabled = true;
+    bool has_economy_enabled = false;
+
+    uint32_t economy_after_seconds = 0;
+    bool has_economy_after_seconds = false;
+
+    uint32_t normal_gps_interval_seconds = 0;
+    bool has_normal_gps_interval_seconds = false;
+
+    uint32_t economy_gps_interval_seconds = 0;
+    bool has_economy_gps_interval_seconds = false;
+
+    ReportingPhase reporting_phase = ReportingPhase::INACTIVE;
+    bool has_reporting_phase = false;
+
+    uint32_t separation_elapsed_seconds = 0;
+    bool has_separation_elapsed_seconds = false;
+
+    uint32_t next_gps_report_due_seconds = 0;
+    bool has_next_gps_report_due_seconds = false;
 };
 
 // Returns encoded length, or 0 on failure.

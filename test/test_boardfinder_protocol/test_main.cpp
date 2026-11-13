@@ -1,4 +1,5 @@
 #include "modules/BoardFinder/boardfinder_adv.h"
+#include "modules/BoardFinder/boardfinder_economy.h"
 #include "modules/BoardFinder/boardfinder_identify.h"
 #include "modules/BoardFinder/boardfinder_protocol.h"
 #include "modules/BoardFinder/boardfinder_sound.h"
@@ -381,6 +382,150 @@ void test_identify_alternating_phases()
     TEST_ASSERT_FALSE(on);
 }
 
+void test_economy_defaults_and_validation()
+{
+    EconomySettings d = defaultEconomySettings();
+    TEST_ASSERT_TRUE(d.economy_enabled);
+    TEST_ASSERT_EQUAL_UINT32(DEFAULT_ECONOMY_AFTER_S, d.economy_after_seconds);
+    TEST_ASSERT_EQUAL_UINT32(DEFAULT_NORMAL_GPS_S, d.normal_gps_interval_seconds);
+    TEST_ASSERT_EQUAL_UINT32(DEFAULT_ECONOMY_GPS_S, d.economy_gps_interval_seconds);
+    TEST_ASSERT_TRUE(validateEconomySettings(d));
+
+    EconomySettings bad = d;
+    bad.economy_after_seconds = 60; // below 5 min
+    TEST_ASSERT_FALSE(validateEconomySettings(bad));
+    bad = d;
+    bad.economy_gps_interval_seconds = 30; // below normal
+    TEST_ASSERT_FALSE(validateEconomySettings(bad));
+    bad = d;
+    bad.normal_gps_interval_seconds = 120;
+    bad.economy_gps_interval_seconds = 60; // economy < normal
+    TEST_ASSERT_FALSE(validateEconomySettings(bad));
+}
+
+void test_economy_scheduler_phases()
+{
+    GpsReportScheduler sched;
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::INACTIVE), static_cast<int>(sched.phase()));
+
+    sched.onEnterSeparated(0);
+    TEST_ASSERT_TRUE(sched.active());
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phase()));
+    TEST_ASSERT_TRUE(sched.isDue(0)); // first report immediate
+    sched.markAttempted(0);
+    TEST_ASSERT_FALSE(sched.isDue(30000));
+    TEST_ASSERT_TRUE(sched.isDue(60000));
+
+    sched.refreshPhase(3599 * 1000u);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phase()));
+    sched.refreshPhase(3600 * 1000u);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::ECONOMY), static_cast<int>(sched.phase()));
+    TEST_ASSERT_EQUAL_UINT32(DEFAULT_ECONOMY_GPS_S, sched.intervalSeconds());
+}
+
+void test_economy_no_duplicate_at_phase_transition()
+{
+    GpsReportScheduler sched;
+    sched.onEnterSeparated(0);
+    sched.markAttempted(3590 * 1000u); // reported 10s before threshold
+    sched.refreshPhase(3600 * 1000u);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::ECONOMY), static_cast<int>(sched.phase()));
+    // Last attempt 10s ago; economy interval 300s → not due
+    TEST_ASSERT_FALSE(sched.isDue(3600 * 1000u));
+    TEST_ASSERT_TRUE(sched.isDue((3590 + 300) * 1000u));
+}
+
+void test_economy_recovery_and_disable()
+{
+    GpsReportScheduler sched;
+    sched.onEnterSeparated(0);
+    sched.refreshPhase(4000 * 1000u);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::ECONOMY), static_cast<int>(sched.phase()));
+    sched.reset();
+    TEST_ASSERT_FALSE(sched.active());
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::INACTIVE), static_cast<int>(sched.phase()));
+
+    sched.onEnterSeparated(10000);
+    EconomySettings off = defaultEconomySettings();
+    off.economy_enabled = false;
+    sched.setSettings(off, 10000 + 5000 * 1000u);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phase()));
+}
+
+void test_economy_new_separation_restarts_normal()
+{
+    GpsReportScheduler sched;
+    sched.onEnterSeparated(0);
+    sched.refreshPhase(4000 * 1000u);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::ECONOMY), static_cast<int>(sched.phase()));
+    sched.onEnterSeparated(5000 * 1000u); // new incident
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phase()));
+    TEST_ASSERT_EQUAL_UINT32(0, sched.separationElapsedSeconds(5000 * 1000u));
+}
+
+void test_encode_decode_economy_config()
+{
+    Message req{};
+    req.protocol_version = PROTOCOL_VERSION;
+    req.request_id = 77;
+    req.command = Command::SET_CONFIG;
+    req.economy_enabled = true;
+    req.has_economy_enabled = true;
+    req.economy_after_seconds = 3600;
+    req.has_economy_after_seconds = true;
+    req.normal_gps_interval_seconds = 60;
+    req.has_normal_gps_interval_seconds = true;
+    req.economy_gps_interval_seconds = 300;
+    req.has_economy_gps_interval_seconds = true;
+
+    uint8_t buf[MAX_MESSAGE_BYTES];
+    size_t len = encodeMessage(req, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(len > 0);
+    Message out{};
+    TEST_ASSERT_TRUE(decodeMessage(buf, len, out));
+    TEST_ASSERT_TRUE(out.has_economy_enabled);
+    TEST_ASSERT_TRUE(out.economy_enabled);
+    TEST_ASSERT_EQUAL_UINT32(3600, out.economy_after_seconds);
+    TEST_ASSERT_EQUAL_UINT32(60, out.normal_gps_interval_seconds);
+    TEST_ASSERT_EQUAL_UINT32(300, out.economy_gps_interval_seconds);
+    TEST_ASSERT_FALSE(out.has_ble_burst_enabled); // partial update must not invent burst fields
+}
+
+void test_encode_board_status_economy()
+{
+    Message st{};
+    st.protocol_version = PROTOCOL_VERSION;
+    st.request_id = 5;
+    st.command = Command::BOARD_STATUS_RESPONSE;
+    st.board_state = BoardState::SEPARATED;
+    st.has_board_state = true;
+    st.reporting_phase = ReportingPhase::ECONOMY;
+    st.has_reporting_phase = true;
+    st.economy_enabled = true;
+    st.has_economy_enabled = true;
+    st.economy_after_seconds = 3600;
+    st.has_economy_after_seconds = true;
+    st.normal_gps_interval_seconds = 60;
+    st.has_normal_gps_interval_seconds = true;
+    st.economy_gps_interval_seconds = 300;
+    st.has_economy_gps_interval_seconds = true;
+    st.separation_elapsed_seconds = 4440;
+    st.has_separation_elapsed_seconds = true;
+    st.next_gps_report_due_seconds = 120;
+    st.has_next_gps_report_due_seconds = true;
+    st.status = Status::OK;
+
+    uint8_t buf[MAX_MESSAGE_BYTES];
+    size_t len = encodeMessage(st, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(len > 0);
+    TEST_ASSERT_TRUE(len < MAX_MESSAGE_BYTES);
+    Message out{};
+    TEST_ASSERT_TRUE(decodeMessage(buf, len, out));
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::ECONOMY), static_cast<int>(out.reporting_phase));
+    TEST_ASSERT_EQUAL_UINT32(4440, out.separation_elapsed_seconds);
+    TEST_ASSERT_EQUAL_UINT32(120, out.next_gps_report_due_seconds);
+}
+
 void setup()
 {
     UNITY_BEGIN();
@@ -407,6 +552,13 @@ void setup()
     RUN_TEST(test_identify_auto_stop_without_caller);
     RUN_TEST(test_identify_ownership_clears_on_stop);
     RUN_TEST(test_identify_alternating_phases);
+    RUN_TEST(test_economy_defaults_and_validation);
+    RUN_TEST(test_economy_scheduler_phases);
+    RUN_TEST(test_economy_no_duplicate_at_phase_transition);
+    RUN_TEST(test_economy_recovery_and_disable);
+    RUN_TEST(test_economy_new_separation_restarts_normal);
+    RUN_TEST(test_encode_decode_economy_config);
+    RUN_TEST(test_encode_board_status_economy);
     UNITY_END();
 }
 

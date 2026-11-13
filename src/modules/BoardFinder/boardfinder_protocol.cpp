@@ -21,6 +21,13 @@ constexpr uint8_t TAG_LAST_RIDER_RSSI = 13;
 constexpr uint8_t TAG_LAST_RIDER_SEEN_AGE = 14;
 constexpr uint8_t TAG_GPS_TRACKING_ACTIVE = 15;
 constexpr uint8_t TAG_LAST_GPS_REPORT_STATUS = 16;
+constexpr uint8_t TAG_ECONOMY_ENABLED = 17;
+constexpr uint8_t TAG_ECONOMY_AFTER_SECONDS = 18;
+constexpr uint8_t TAG_NORMAL_GPS_INTERVAL_SECONDS = 19;
+constexpr uint8_t TAG_ECONOMY_GPS_INTERVAL_SECONDS = 20;
+constexpr uint8_t TAG_REPORTING_PHASE = 21;
+constexpr uint8_t TAG_SEPARATION_ELAPSED_SECONDS = 22;
+constexpr uint8_t TAG_NEXT_GPS_REPORT_DUE_SECONDS = 23;
 
 bool writeByte(uint8_t **pp, uint8_t *end, uint8_t v)
 {
@@ -81,6 +88,13 @@ bool wantsBleBurstField(const Message &msg)
            msg.command == Command::BOARD_STATUS_RESPONSE;
 }
 
+bool wantsEconomyConfigFields(const Message &msg)
+{
+    return msg.command == Command::CONFIG_RESPONSE || msg.command == Command::BOARD_STATUS_RESPONSE ||
+           msg.has_economy_enabled || msg.has_economy_after_seconds || msg.has_normal_gps_interval_seconds ||
+           msg.has_economy_gps_interval_seconds;
+}
+
 } // namespace
 
 size_t encodeMessage(const Message &msg, uint8_t *out, size_t outMax)
@@ -116,7 +130,7 @@ size_t encodeMessage(const Message &msg, uint8_t *out, size_t outMax)
         if (!writeKeyVarint(&p, end, TAG_RIDER_NODE_ID, msg.rider_node_id))
             return 0;
     }
-    if (msg.has_board_armed || msg.command == Command::BOARD_STATUS_RESPONSE) {
+    if (msg.has_board_armed || msg.command == Command::BOARD_STATUS_RESPONSE || msg.command == Command::CONFIG_RESPONSE) {
         if (!writeKeyVarint(&p, end, TAG_BOARD_ARMED, msg.board_armed ? 1u : 0u))
             return 0;
     }
@@ -146,6 +160,41 @@ size_t encodeMessage(const Message &msg, uint8_t *out, size_t outMax)
     }
     if (msg.has_last_gps_report_status || msg.command == Command::BOARD_STATUS_RESPONSE) {
         if (!writeKeyVarint(&p, end, TAG_LAST_GPS_REPORT_STATUS, static_cast<uint32_t>(msg.last_gps_report_status)))
+            return 0;
+    }
+
+    if (wantsEconomyConfigFields(msg) || msg.command == Command::CONFIG_RESPONSE || msg.command == Command::BOARD_STATUS_RESPONSE) {
+        if (msg.has_economy_enabled || msg.command == Command::CONFIG_RESPONSE || msg.command == Command::BOARD_STATUS_RESPONSE) {
+            if (!writeKeyVarint(&p, end, TAG_ECONOMY_ENABLED, msg.economy_enabled ? 1u : 0u))
+                return 0;
+        }
+        if (msg.has_economy_after_seconds || msg.command == Command::CONFIG_RESPONSE ||
+            msg.command == Command::BOARD_STATUS_RESPONSE) {
+            if (!writeKeyVarint(&p, end, TAG_ECONOMY_AFTER_SECONDS, msg.economy_after_seconds))
+                return 0;
+        }
+        if (msg.has_normal_gps_interval_seconds || msg.command == Command::CONFIG_RESPONSE ||
+            msg.command == Command::BOARD_STATUS_RESPONSE) {
+            if (!writeKeyVarint(&p, end, TAG_NORMAL_GPS_INTERVAL_SECONDS, msg.normal_gps_interval_seconds))
+                return 0;
+        }
+        if (msg.has_economy_gps_interval_seconds || msg.command == Command::CONFIG_RESPONSE ||
+            msg.command == Command::BOARD_STATUS_RESPONSE) {
+            if (!writeKeyVarint(&p, end, TAG_ECONOMY_GPS_INTERVAL_SECONDS, msg.economy_gps_interval_seconds))
+                return 0;
+        }
+    }
+
+    if (msg.has_reporting_phase || msg.command == Command::BOARD_STATUS_RESPONSE) {
+        if (!writeKeyVarint(&p, end, TAG_REPORTING_PHASE, static_cast<uint32_t>(msg.reporting_phase)))
+            return 0;
+    }
+    if (msg.has_separation_elapsed_seconds) {
+        if (!writeKeyVarint(&p, end, TAG_SEPARATION_ELAPSED_SECONDS, msg.separation_elapsed_seconds))
+            return 0;
+    }
+    if (msg.has_next_gps_report_due_seconds) {
+        if (!writeKeyVarint(&p, end, TAG_NEXT_GPS_REPORT_DUE_SECONDS, msg.next_gps_report_due_seconds))
             return 0;
     }
 
@@ -255,6 +304,34 @@ bool decodeMessage(const uint8_t *in, size_t inLen, Message &out)
         case TAG_LAST_GPS_REPORT_STATUS:
             out.last_gps_report_status = static_cast<GpsReportStatus>(value);
             out.has_last_gps_report_status = true;
+            break;
+        case TAG_ECONOMY_ENABLED:
+            out.economy_enabled = value != 0;
+            out.has_economy_enabled = true;
+            break;
+        case TAG_ECONOMY_AFTER_SECONDS:
+            out.economy_after_seconds = value;
+            out.has_economy_after_seconds = true;
+            break;
+        case TAG_NORMAL_GPS_INTERVAL_SECONDS:
+            out.normal_gps_interval_seconds = value;
+            out.has_normal_gps_interval_seconds = true;
+            break;
+        case TAG_ECONOMY_GPS_INTERVAL_SECONDS:
+            out.economy_gps_interval_seconds = value;
+            out.has_economy_gps_interval_seconds = true;
+            break;
+        case TAG_REPORTING_PHASE:
+            out.reporting_phase = static_cast<ReportingPhase>(value);
+            out.has_reporting_phase = true;
+            break;
+        case TAG_SEPARATION_ELAPSED_SECONDS:
+            out.separation_elapsed_seconds = value;
+            out.has_separation_elapsed_seconds = true;
+            break;
+        case TAG_NEXT_GPS_REPORT_DUE_SECONDS:
+            out.next_gps_report_due_seconds = value;
+            out.has_next_gps_report_due_seconds = true;
             break;
         default:
             break;

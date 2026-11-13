@@ -2,6 +2,7 @@
 
 #if defined(TRACKER_T1000_E)
 
+#include "boardfinder_economy.h"
 #include "boardfinder_protocol.h"
 #include "concurrency/Lock.h"
 #include "concurrency/OSThread.h"
@@ -19,6 +20,7 @@ class BoardFinderEngine : private concurrency::OSThread
         uint32_t rider_node_id = 0;
         bool board_armed = false;
         bool ble_burst_enabled = false;
+        boardfinder::EconomySettings economy = boardfinder::defaultEconomySettings();
     };
 
     struct StatusSnapshot {
@@ -34,6 +36,12 @@ class BoardFinderEngine : private concurrency::OSThread
         bool has_last_rider_seen_age_seconds = false;
         bool gps_tracking_active = false;
         boardfinder::GpsReportStatus last_gps_report_status = boardfinder::GpsReportStatus::NONE;
+        boardfinder::ReportingPhase reporting_phase = boardfinder::ReportingPhase::INACTIVE;
+        boardfinder::EconomySettings economy = boardfinder::defaultEconomySettings();
+        uint32_t separation_elapsed_seconds = 0;
+        bool has_separation_elapsed_seconds = false;
+        uint32_t next_gps_report_due_seconds = 0;
+        bool has_next_gps_report_due_seconds = false;
     };
 
     BoardFinderEngine();
@@ -94,8 +102,8 @@ class BoardFinderEngine : private concurrency::OSThread
     bool hasSeen = false;
 
     bool gpsTrackingActive = false;
-    uint32_t lastGpsAttemptMs = 0;
     boardfinder::GpsReportStatus lastGpsStatus = boardfinder::GpsReportStatus::NONE;
+    boardfinder::GpsReportScheduler gpsScheduler{};
 
     // Latest observation posted by scan callback.
     uint32_t pendingNodeId = 0;

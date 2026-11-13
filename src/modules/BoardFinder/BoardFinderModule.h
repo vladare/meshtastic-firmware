@@ -4,6 +4,7 @@
 
 #include "BoardFinderEngine.h"
 #include "SinglePortModule.h"
+#include "boardfinder_economy.h"
 #include "boardfinder_protocol.h"
 #include "concurrency/Lock.h"
 #include "mesh/MeshTypes.h"
@@ -27,6 +28,7 @@ class BoardFinderModule : public SinglePortModule
         bool ble_burst_enabled = false;
         boardfinder::DeviceRole device_role = boardfinder::DeviceRole::NORMAL;
         uint32_t rider_node_id = 0;
+        boardfinder::EconomySettings economy = boardfinder::defaultEconomySettings();
     };
 
     // Runtime ARM mirror for CONFIG_RESPONSE; source of truth is BoardFinderEngine.
@@ -39,6 +41,7 @@ class BoardFinderModule : public SinglePortModule
 
     void applyRuntime(bool restartIfArmed);
     bool persistIfChanged(const Prefs &next);
+    void fillEconomyFields(boardfinder::Message &msg) const;
     void replyError(uint32_t requestId, boardfinder::ErrorCode code);
     void replyConfig(uint32_t requestId);
     void replyBoardStatus(uint32_t requestId);

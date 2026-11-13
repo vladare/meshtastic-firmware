@@ -5,6 +5,7 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "boardfinder_adv.h"
+#include "boardfinder_economy.h"
 #include "boardfinder_sound.h"
 #include "configuration.h"
 #include "main.h"
@@ -28,7 +29,6 @@ constexpr uint32_t kBurstGroupMs = 4000;
 constexpr uint32_t kPeriodMinMs = 45000;
 constexpr uint32_t kPeriodMaxMs = 90000;
 constexpr uint32_t kSyncTimeoutMs = 150000;
-constexpr uint32_t kGpsReportIntervalMs = 60000;
 constexpr uint32_t kReacquireEveryN = 3;
 constexpr uint32_t kReacquireScanMs = 20000;
 constexpr uint32_t kDiscoveryNotFoundMs = 60000;
@@ -61,6 +61,7 @@ void BoardFinderEngine::onRiderAdvertisement(uint32_t nodeId, int8_t rssi, uint3
 void BoardFinderEngine::applyConfig(const Config &newCfg, bool restartIfArmed)
 {
     cfg = newCfg;
+    gpsScheduler.setSettings(cfg.economy, millis());
     // Rider bursts: allowed for NORMAL (compat) and RIDER; never for BOARD.
     const bool allowBurst = cfg.ble_burst_enabled && cfg.role != boardfinder::DeviceRole::BOARD;
     t1000eBurstSetEnabled(allowBurst);
@@ -141,6 +142,7 @@ void BoardFinderEngine::resetAcquisitionSoundFlags()
 
 BoardFinderEngine::StatusSnapshot BoardFinderEngine::status() const
 {
+    const uint32_t now = millis();
     StatusSnapshot s{};
     s.device_role = cfg.role;
     s.rider_node_id = cfg.rider_node_id;
@@ -152,10 +154,30 @@ BoardFinderEngine::StatusSnapshot BoardFinderEngine::status() const
     s.last_rider_rssi = lastRssi;
     if (hasSeen) {
         s.has_last_rider_seen_age_seconds = true;
-        s.last_rider_seen_age_seconds = (millis() - lastSeenMs) / 1000u;
+        s.last_rider_seen_age_seconds = (now - lastSeenMs) / 1000u;
     }
     s.gps_tracking_active = gpsTrackingActive;
     s.last_gps_report_status = lastGpsStatus;
+    s.economy = cfg.economy;
+    s.reporting_phase = gpsScheduler.active() ? gpsScheduler.phase() : boardfinder::ReportingPhase::INACTIVE;
+    // Refresh phase for status without mutating: recompute via nextDue / elapsed.
+    if (gpsScheduler.active()) {
+        s.has_separation_elapsed_seconds = true;
+        s.separation_elapsed_seconds = gpsScheduler.separationElapsedSeconds(now);
+        uint32_t due = 0;
+        if (gpsScheduler.nextDueSeconds(now, due)) {
+            s.has_next_gps_report_due_seconds = true;
+            s.next_gps_report_due_seconds = due;
+        }
+        // Mirror live phase (economy threshold may have elapsed since last tick).
+        if (!cfg.economy.economy_enabled) {
+            s.reporting_phase = boardfinder::ReportingPhase::NORMAL;
+        } else if (s.separation_elapsed_seconds >= cfg.economy.economy_after_seconds) {
+            s.reporting_phase = boardfinder::ReportingPhase::ECONOMY;
+        } else {
+            s.reporting_phase = boardfinder::ReportingPhase::NORMAL;
+        }
+    }
     return s;
 }
 
@@ -271,9 +293,10 @@ void BoardFinderEngine::enterSeparated()
     transitionTo(boardfinder::BoardState::SEPARATED);
     boardfinder::playBoardFinderSound(boardfinder::BoardFinderSound::SEPARATION_DETECTED);
     gpsTrackingActive = true;
-    lastGpsAttemptMs = 0;
     lastGpsStatus = boardfinder::GpsReportStatus::NONE;
-    LOG_INFO("[BF] SEPARATED — GPS tracking on");
+    gpsScheduler.setSettings(cfg.economy, millis());
+    gpsScheduler.onEnterSeparated(millis());
+    LOG_INFO("[BF] SEPARATED — GPS tracking on (economy_after=%us)", cfg.economy.economy_after_seconds);
 }
 
 void BoardFinderEngine::recoverFromSeparated(uint32_t burstStartMs, int8_t rssi)
@@ -293,15 +316,20 @@ void BoardFinderEngine::recoverFromSeparated(uint32_t burstStartMs, int8_t rssi)
 void BoardFinderEngine::stopGpsTracking()
 {
     gpsTrackingActive = false;
+    gpsScheduler.reset();
 }
 
 void BoardFinderEngine::maybeReportGps(uint32_t nowMs)
 {
     if (!gpsTrackingActive)
         return;
-    if (lastGpsAttemptMs != 0 && (nowMs - lastGpsAttemptMs) < kGpsReportIntervalMs)
+
+    gpsScheduler.refreshPhase(nowMs);
+    if (!gpsScheduler.isDue(nowMs))
         return;
-    lastGpsAttemptMs = nowMs;
+
+    // Mark attempt before send so phase/interval changes cannot double-fire.
+    gpsScheduler.markAttempted(nowMs);
 
 #if !MESHTASTIC_EXCLUDE_GPS
     if (gps && config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED) {
@@ -312,14 +340,15 @@ void BoardFinderEngine::maybeReportGps(uint32_t nowMs)
     meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNode(nodeDB->getNodeNum()) : nullptr;
     if (!node || !nodeDB->hasValidPosition(node) || !nodeDB->hasLocalPositionSinceBoot()) {
         lastGpsStatus = boardfinder::GpsReportStatus::UNAVAILABLE;
-        LOG_INFO("[BF] GPS unavailable — skip Position");
+        LOG_INFO("[BF] GPS unavailable — skip Position (phase=%u)", static_cast<unsigned>(gpsScheduler.phase()));
         return;
     }
 
     if (positionModule) {
         positionModule->sendOurPosition();
         lastGpsStatus = boardfinder::GpsReportStatus::OK;
-        LOG_INFO("[BF] Position report sent");
+        LOG_INFO("[BF] Position report sent phase=%u interval=%us", static_cast<unsigned>(gpsScheduler.phase()),
+                 gpsScheduler.intervalSeconds());
     } else {
         lastGpsStatus = boardfinder::GpsReportStatus::FAILED;
     }
