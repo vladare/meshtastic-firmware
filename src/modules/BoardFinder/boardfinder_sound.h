@@ -13,13 +13,16 @@ constexpr uint16_t TONE_DURATION_MS = 120;
 constexpr uint16_t TONE_GAP_MS = 100;
 constexpr uint16_t GROUP_GAP_MS = 250;
 constexpr uint16_t SEPARATION_GAP_MS = 400;
+constexpr uint16_t IDENTIFY_TONE_MS = 100;
+constexpr uint16_t IDENTIFY_GAP_MS = 100;
 
 enum class BoardFinderSound : uint8_t {
     NONE = 0,
-    RIDER_NOT_FOUND = 1,      // priority 1 — Signal C
-    RIDER_DETECTED = 2,       // priority 2 — Signal A
-    SYNCHRONIZED = 3,         // priority 3 — Signal B
-    SEPARATION_DETECTED = 4,  // priority 4 — Signal D
+    RIDER_NOT_FOUND = 1,     // priority 1 — Signal C
+    RIDER_DETECTED = 2,      // priority 2 — Signal A
+    SYNCHRONIZED = 3,        // priority 3 — Signal B
+    IDENTIFY = 4,            // priority 4 — HIGH LOW HIGH LOW
+    SEPARATION_DETECTED = 5, // priority 5 — Signal D (preempts Identify)
 };
 
 struct ToneStep {

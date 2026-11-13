@@ -6,6 +6,7 @@
 #include "NodeDB.h"
 #include "SPILock.h"
 #include "SafeFile.h"
+#include "boardfinder_identify.h"
 #include "configuration.h"
 #include "main.h"
 #include "power/PowerHAL.h"
@@ -414,6 +415,18 @@ ProcessMessage BoardFinderModule::handleReceived(const meshtastic_MeshPacket &mp
 
     case boardfinder::Command::GET_BOARD_STATUS:
         replyBoardStatus(req.request_id);
+        break;
+
+    case boardfinder::Command::IDENTIFY_DEVICE:
+        // Runtime-only action: LED + optional buzzer; no prefs / role / ARM changes.
+        boardfinder::startBoardFinderIdentify();
+        pendingReply = boardfinder::Message{};
+        pendingReply.protocol_version = boardfinder::PROTOCOL_VERSION;
+        pendingReply.request_id = req.request_id;
+        pendingReply.command = boardfinder::Command::IDENTIFY_RESPONSE;
+        pendingReply.status = boardfinder::Status::OK;
+        pendingReply.error_code = boardfinder::ErrorCode::NONE;
+        hasPendingReply = true;
         break;
 
     default:

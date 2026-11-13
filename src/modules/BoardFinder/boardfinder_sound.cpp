@@ -68,6 +68,8 @@ uint8_t soundPriority(BoardFinderSound sound)
 {
     switch (sound) {
     case BoardFinderSound::SEPARATION_DETECTED:
+        return 5;
+    case BoardFinderSound::IDENTIFY:
         return 4;
     case BoardFinderSound::SYNCHRONIZED:
         return 3;
@@ -121,6 +123,16 @@ size_t soundPattern(BoardFinderSound sound, ToneStep *out, size_t outMax)
         appendTone(out, n, outMax, LOW_TONE_HZ, TONE_DURATION_MS);
         appendGap(out, n, outMax, SEPARATION_GAP_MS);
         appendTone(out, n, outMax, LOW_TONE_HZ, TONE_DURATION_MS);
+        break;
+    case BoardFinderSound::IDENTIFY:
+        // HIGH — LOW — HIGH — LOW
+        appendTone(out, n, outMax, HIGH_TONE_HZ, IDENTIFY_TONE_MS);
+        appendGap(out, n, outMax, IDENTIFY_GAP_MS);
+        appendTone(out, n, outMax, LOW_TONE_HZ, IDENTIFY_TONE_MS);
+        appendGap(out, n, outMax, IDENTIFY_GAP_MS);
+        appendTone(out, n, outMax, HIGH_TONE_HZ, IDENTIFY_TONE_MS);
+        appendGap(out, n, outMax, IDENTIFY_GAP_MS);
+        appendTone(out, n, outMax, LOW_TONE_HZ, IDENTIFY_TONE_MS);
         break;
     default:
         break;

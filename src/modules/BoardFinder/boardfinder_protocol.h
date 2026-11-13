@@ -29,6 +29,8 @@ enum class Command : uint8_t {
     DISARM_BOARD = 8,
     GET_BOARD_STATUS = 9,
     BOARD_STATUS_RESPONSE = 10,
+    IDENTIFY_DEVICE = 11,
+    IDENTIFY_RESPONSE = 12,
 };
 
 enum class Status : uint8_t {

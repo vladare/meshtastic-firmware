@@ -3,6 +3,9 @@
 #include "configuration.h"
 #include "mesh/RadioInterface.h"
 #include <Arduino.h>
+#if defined(TRACKER_T1000_E)
+#include "modules/BoardFinder/boardfinder_identify.h"
+#endif
 
 /*
 StatusLEDModule manages the device's status LEDs, updating their states based on power and Bluetooth status.
@@ -216,7 +219,10 @@ int32_t StatusLEDModule::runOnce()
     io.digitalWrite(PCA_LED_ENABLE, CHARGE_LED_state);
 #endif
 #ifdef LED_POWER
-    digitalWrite(LED_POWER, CHARGE_LED_state);
+#if defined(TRACKER_T1000_E)
+    if (!boardfinder::boardFinderIdentifyOwnsLed())
+#endif
+        digitalWrite(LED_POWER, CHARGE_LED_state);
 #endif
 #ifdef LED_PAIRING
     digitalWrite(LED_PAIRING, PAIRING_LED_state);
@@ -285,7 +291,10 @@ void StatusLEDModule::setPowerLED(bool LEDon)
     io.digitalWrite(PCA_LED_ENABLE, ledState);
 #endif
 #ifdef LED_POWER
-    digitalWrite(LED_POWER, ledState);
+#if defined(TRACKER_T1000_E)
+    if (!boardfinder::boardFinderIdentifyOwnsLed())
+#endif
+        digitalWrite(LED_POWER, ledState);
 #endif
 #ifdef LED_PAIRING
     digitalWrite(LED_PAIRING, ledState);

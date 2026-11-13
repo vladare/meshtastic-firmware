@@ -1,4 +1,5 @@
 #include "modules/BoardFinder/boardfinder_adv.h"
+#include "modules/BoardFinder/boardfinder_identify.h"
 #include "modules/BoardFinder/boardfinder_protocol.h"
 #include "modules/BoardFinder/boardfinder_sound.h"
 #include <cstring>
@@ -273,6 +274,87 @@ void test_arm_not_restored_from_flash_policy()
     TEST_ASSERT_FALSE(restoredArmed);
 }
 
+void test_encode_decode_identify()
+{
+    Message req{};
+    req.protocol_version = PROTOCOL_VERSION;
+    req.request_id = 99;
+    req.command = Command::IDENTIFY_DEVICE;
+
+    uint8_t buf[MAX_MESSAGE_BYTES];
+    size_t len = encodeMessage(req, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(len > 0);
+    Message out{};
+    TEST_ASSERT_TRUE(decodeMessage(buf, len, out));
+    TEST_ASSERT_EQUAL(static_cast<int>(Command::IDENTIFY_DEVICE), static_cast<int>(out.command));
+    TEST_ASSERT_EQUAL_UINT32(99, out.request_id);
+
+    Message resp{};
+    resp.protocol_version = PROTOCOL_VERSION;
+    resp.request_id = 99;
+    resp.command = Command::IDENTIFY_RESPONSE;
+    resp.status = Status::OK;
+    len = encodeMessage(resp, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(len > 0);
+    TEST_ASSERT_TRUE(decodeMessage(buf, len, out));
+    TEST_ASSERT_EQUAL(static_cast<int>(Command::IDENTIFY_RESPONSE), static_cast<int>(out.command));
+    TEST_ASSERT_EQUAL(static_cast<int>(Status::OK), static_cast<int>(out.status));
+}
+
+void test_sound_pattern_identify()
+{
+    ToneStep steps[12];
+    size_t n = soundPattern(BoardFinderSound::IDENTIFY, steps, 12);
+    TEST_ASSERT_EQUAL(7, n); // H g L g H g L
+    TEST_ASSERT_EQUAL_UINT16(HIGH_TONE_HZ, steps[0].freq_hz);
+    TEST_ASSERT_EQUAL_UINT16(IDENTIFY_TONE_MS, steps[0].duration_ms);
+    TEST_ASSERT_EQUAL_UINT16(0, steps[1].freq_hz);
+    TEST_ASSERT_EQUAL_UINT16(IDENTIFY_GAP_MS, steps[1].duration_ms);
+    TEST_ASSERT_EQUAL_UINT16(LOW_TONE_HZ, steps[2].freq_hz);
+    TEST_ASSERT_EQUAL_UINT16(HIGH_TONE_HZ, steps[4].freq_hz);
+    TEST_ASSERT_EQUAL_UINT16(LOW_TONE_HZ, steps[6].freq_hz);
+}
+
+void test_identify_sound_yields_to_separation()
+{
+    SoundScheduler sched;
+    TEST_ASSERT_TRUE(sched.request(BoardFinderSound::IDENTIFY));
+    TEST_ASSERT_TRUE(sched.request(BoardFinderSound::SEPARATION_DETECTED));
+    TEST_ASSERT_EQUAL(static_cast<int>(BoardFinderSound::SEPARATION_DETECTED), static_cast<int>(sched.active()));
+    TEST_ASSERT_FALSE(sched.request(BoardFinderSound::IDENTIFY)); // lower while busy
+}
+
+void test_identify_led_timing_and_restart()
+{
+    IdentifyController id;
+    bool on = false;
+    id.start(1000);
+    TEST_ASSERT_TRUE(id.isActive());
+    TEST_ASSERT_TRUE(id.ownsLed());
+    TEST_ASSERT_FALSE(id.tick(1000, on)); // first half-period still ON
+    TEST_ASSERT_TRUE(id.tick(1125, on));
+    TEST_ASSERT_FALSE(on);
+    TEST_ASSERT_TRUE(id.tick(1250, on));
+    TEST_ASSERT_TRUE(on);
+
+    // Restart resets the 5s window.
+    id.start(2000);
+    TEST_ASSERT_TRUE(id.tick(7000, on)); // exactly 5s later
+    TEST_ASSERT_FALSE(id.isActive());
+    TEST_ASSERT_FALSE(on);
+    TEST_ASSERT_FALSE(id.ownsLed());
+}
+
+void test_identify_auto_stop_without_caller()
+{
+    IdentifyController id;
+    bool on = false;
+    id.start(0);
+    TEST_ASSERT_TRUE(id.tick(IDENTIFY_DURATION_MS, on));
+    TEST_ASSERT_FALSE(id.isActive());
+    TEST_ASSERT_FALSE(id.tick(IDENTIFY_DURATION_MS + 1000, on));
+}
+
 void setup()
 {
     UNITY_BEGIN();
@@ -292,6 +374,11 @@ void setup()
     RUN_TEST(test_sound_scheduler_priority_and_stop);
     RUN_TEST(test_sound_scheduler_sequence_timing);
     RUN_TEST(test_arm_not_restored_from_flash_policy);
+    RUN_TEST(test_encode_decode_identify);
+    RUN_TEST(test_sound_pattern_identify);
+    RUN_TEST(test_identify_sound_yields_to_separation);
+    RUN_TEST(test_identify_led_timing_and_restart);
+    RUN_TEST(test_identify_auto_stop_without_caller);
     UNITY_END();
 }
 
