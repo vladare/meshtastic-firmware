@@ -30,17 +30,26 @@ void t1000eBoardScanSetCallback(T1000eBoardScanCallback cb)
 
 bool t1000eBoardScanStart()
 {
-    if (gRunning)
-        return true;
+    if (gRunning) {
+        // SoftDevice can stop reporting after errors; ensure callback stays armed.
+        if (!Bluefruit.Scanner.isRunning()) {
+            LOG_WARN("[BF-SCAN] flag set but scanner idle — restarting");
+            gRunning = false;
+        } else {
+            return true;
+        }
+    }
 
     Bluefruit.Scanner.setRxCallback(onScanReport);
     Bluefruit.Scanner.restartOnDisconnect(false);
     Bluefruit.Scanner.useActiveScan(false);
-    // 100 ms interval, 50 ms window — enough for 100 ms Rider adv events without saturating radio.
-    Bluefruit.Scanner.setIntervalMS(100, 50);
+    // Window == interval → continuous scan. Rider advertises every 100 ms during a 3 s burst;
+    // a 50% duty cycle previously risked missing the entire second sync window.
+    Bluefruit.Scanner.setIntervalMS(100, 100);
     Bluefruit.Scanner.clearFilters();
     if (!Bluefruit.Scanner.start(0)) {
         LOG_ERROR("[BF-SCAN] start failed");
+        gRunning = false;
         return false;
     }
     gRunning = true;
@@ -50,7 +59,7 @@ bool t1000eBoardScanStart()
 
 void t1000eBoardScanStop()
 {
-    if (!gRunning)
+    if (!gRunning && !Bluefruit.Scanner.isRunning())
         return;
     Bluefruit.Scanner.stop();
     gRunning = false;

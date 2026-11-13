@@ -24,7 +24,9 @@ constexpr uint32_t kScanPreMs = 3000;
 constexpr uint32_t kScanPostMs = 3000;
 constexpr uint32_t kScanWindowMs = kScanPreMs + kBurstDurationMs + kScanPostMs; // 9 s
 constexpr uint32_t kBurstGroupMs = 4000;
-constexpr uint32_t kPeriodToleranceMs = 15000;
+// Accept second sync burst from 45 s .. 90 s after the first (covers phase skew + late windows).
+constexpr uint32_t kPeriodMinMs = 45000;
+constexpr uint32_t kPeriodMaxMs = 90000;
 constexpr uint32_t kSyncTimeoutMs = 150000;
 constexpr uint32_t kGpsReportIntervalMs = 60000;
 constexpr uint32_t kReacquireEveryN = 3;
@@ -353,24 +355,31 @@ void BoardFinderEngine::handleObservationLocked(uint32_t nodeId, int8_t rssi, ui
         notFoundSoundPlayed = true; // suppress Signal C after first detection
         transitionTo(boardfinder::BoardState::SYNCHRONIZING);
         boardfinder::playBoardFinderSound(boardfinder::BoardFinderSound::RIDER_DETECTED);
-        stopScan();
-        windowOpen = false;
+        // Keep scanning through SYNCHRONIZING. Stopping here and relying on a later 9 s
+        // window was missing the second Rider burst in the field (repeated Signal A only).
+        windowOpen = true;
+        windowEndMs = 0;
         nextWindowOpenMs = nowMs + kBurstPeriodMs - kScanPreMs;
-        LOG_INFO("[BF] first burst @%u -> SYNCHRONIZING", nowMs);
+        if (!t1000eBoardScanIsRunning())
+            t1000eBoardScanStart();
+        LOG_INFO("[BF] first burst @%u -> SYNCHRONIZING (scan continues)", nowMs);
         return;
     }
 
     if (state == boardfinder::BoardState::SYNCHRONIZING) {
         const uint32_t delta = nowMs - firstBurstMs;
-        if (delta + kPeriodToleranceMs >= kBurstPeriodMs && delta <= kBurstPeriodMs + kPeriodToleranceMs) {
+        if (delta >= kPeriodMinMs && delta <= kPeriodMaxMs) {
             phaseAnchorMs = nowMs;
+            LOG_INFO("[BF] second burst delta=%u ms -> sync", delta);
             onSyncComplete();
-        } else if (delta > kBurstPeriodMs + kPeriodToleranceMs) {
+        } else if (delta > kPeriodMaxMs) {
             // Late but distinct — treat as new first burst and keep synchronizing.
             firstBurstMs = nowMs;
             phaseAnchorMs = nowMs;
             nextWindowOpenMs = nowMs + kBurstPeriodMs - kScanPreMs;
-            LOG_WARN("[BF] sync period outlier delta=%u, re-anchor", delta);
+            LOG_WARN("[BF] sync period outlier delta=%u, re-anchor (no detect sound)", delta);
+        } else {
+            LOG_DEBUG("[BF] sync burst ignored early delta=%u", delta);
         }
         return;
     }
@@ -424,22 +433,23 @@ int32_t BoardFinderEngine::runOnce()
     }
 
     if (state == boardfinder::BoardState::DISCOVERING || state == boardfinder::BoardState::SYNCHRONIZING) {
+        // Acquisition must keep the SoftDevice observer alive until MONITORING.
+        if (!t1000eBoardScanIsRunning()) {
+            LOG_WARN("[BF] acquisition scanner idle — restarting");
+            t1000eBoardScanStart();
+            windowOpen = true;
+            windowEndMs = 0;
+        }
         if ((now - armStartedMs) > kSyncTimeoutMs) {
             LOG_WARN("[BF] sync timeout");
             transitionTo(boardfinder::BoardState::ERROR);
-            stopScan();
             // Bounded retry: return to DISCOVERING (new acquisition attempt).
             armStartedMs = now;
             firstBurstMs = 0;
+            inBurstObservation = false;
             resetAcquisitionSoundFlags();
             transitionTo(boardfinder::BoardState::DISCOVERING);
             startDiscoveryScan();
-        }
-    }
-
-    if (state == boardfinder::BoardState::SYNCHRONIZING && !windowOpen) {
-        if ((int32_t)(now - nextWindowOpenMs) >= 0) {
-            openScanWindow(now);
         }
     }
 
