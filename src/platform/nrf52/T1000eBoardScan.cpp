@@ -12,14 +12,18 @@ bool gRunning = false;
 
 void onScanReport(ble_gap_evt_adv_report_t *report)
 {
-    if (report == nullptr || gCallback == nullptr)
-        return;
+    // SoftDevice pauses scanning after every ADV report. Bluefruit does NOT resume when
+    // the rx callback is invoked — the application must call Scanner.resume() (see Adafruit
+    // central_scan examples). Without this, Board hears at most one advertisement after start.
+    if (report != nullptr && gCallback != nullptr) {
+        boardfinder::RiderAdvMatch match{};
+        if (boardfinder::parseRiderServiceData(report->data.p_data, report->data.len, match) && match.matched) {
+            gCallback(match.node_id, report->rssi, millis());
+        }
+    }
 
-    boardfinder::RiderAdvMatch match{};
-    if (!boardfinder::parseRiderServiceData(report->data.p_data, report->data.len, match) || !match.matched)
-        return;
-
-    gCallback(match.node_id, report->rssi, millis());
+    if (gRunning)
+        Bluefruit.Scanner.resume();
 }
 } // namespace
 
@@ -30,21 +34,13 @@ void t1000eBoardScanSetCallback(T1000eBoardScanCallback cb)
 
 bool t1000eBoardScanStart()
 {
-    if (gRunning) {
-        // SoftDevice can stop reporting after errors; ensure callback stays armed.
-        if (!Bluefruit.Scanner.isRunning()) {
-            LOG_WARN("[BF-SCAN] flag set but scanner idle — restarting");
-            gRunning = false;
-        } else {
-            return true;
-        }
-    }
+    if (gRunning)
+        return true;
 
     Bluefruit.Scanner.setRxCallback(onScanReport);
     Bluefruit.Scanner.restartOnDisconnect(false);
     Bluefruit.Scanner.useActiveScan(false);
-    // Window == interval → continuous scan. Rider advertises every 100 ms during a 3 s burst;
-    // a 50% duty cycle previously risked missing the entire second sync window.
+    // Continuous scan (window == interval). Rider advertises every 100 ms during a 3 s burst.
     Bluefruit.Scanner.setIntervalMS(100, 100);
     Bluefruit.Scanner.clearFilters();
     if (!Bluefruit.Scanner.start(0)) {
@@ -59,10 +55,10 @@ bool t1000eBoardScanStart()
 
 void t1000eBoardScanStop()
 {
-    if (!gRunning && !Bluefruit.Scanner.isRunning())
+    if (!gRunning)
         return;
-    Bluefruit.Scanner.stop();
     gRunning = false;
+    Bluefruit.Scanner.stop();
     LOG_INFO("[BF-SCAN] stopped");
 }
 
