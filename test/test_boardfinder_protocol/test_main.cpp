@@ -355,6 +355,32 @@ void test_identify_auto_stop_without_caller()
     TEST_ASSERT_FALSE(id.tick(IDENTIFY_DURATION_MS + 1000, on));
 }
 
+void test_identify_ownership_clears_on_stop()
+{
+    IdentifyController id;
+    id.start(0);
+    TEST_ASSERT_TRUE(id.ownsLed());
+    id.stop();
+    TEST_ASSERT_FALSE(id.ownsLed());
+    TEST_ASSERT_FALSE(id.isActive());
+}
+
+void test_identify_alternating_phases()
+{
+    IdentifyController id;
+    bool on = false;
+    id.start(0);
+    // start() leaves logical LED ON until first half-period elapses
+    TEST_ASSERT_FALSE(id.tick(0, on));
+    TEST_ASSERT_TRUE(on);
+    TEST_ASSERT_TRUE(id.tick(IDENTIFY_HALF_PERIOD_MS, on));
+    TEST_ASSERT_FALSE(on);
+    TEST_ASSERT_TRUE(id.tick(2 * IDENTIFY_HALF_PERIOD_MS, on));
+    TEST_ASSERT_TRUE(on);
+    TEST_ASSERT_TRUE(id.tick(3 * IDENTIFY_HALF_PERIOD_MS, on));
+    TEST_ASSERT_FALSE(on);
+}
+
 void setup()
 {
     UNITY_BEGIN();
@@ -379,6 +405,8 @@ void setup()
     RUN_TEST(test_identify_sound_yields_to_separation);
     RUN_TEST(test_identify_led_timing_and_restart);
     RUN_TEST(test_identify_auto_stop_without_caller);
+    RUN_TEST(test_identify_ownership_clears_on_stop);
+    RUN_TEST(test_identify_alternating_phases);
     UNITY_END();
 }
 

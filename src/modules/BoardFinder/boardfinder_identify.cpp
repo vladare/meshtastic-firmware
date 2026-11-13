@@ -64,6 +64,10 @@ class IdentifyThread : private concurrency::OSThread
         ctrl_.start(now);
         applyLed(true);
         playBoardFinderSound(BoardFinderSound::IDENTIFY);
+        // Kick the first tone immediately; subsequent steps come from runOnce().
+        boardFinderSoundPoll(now);
+        // disable() clears enabled; setInterval alone does not re-arm the thread.
+        enabled = true;
         setIntervalFromNow(0);
     }
 
@@ -80,13 +84,15 @@ class IdentifyThread : private concurrency::OSThread
             if (ctrl_.isActive()) {
                 applyLed(ledOn);
             } else {
-                restoreLed();
+                releaseLed();
                 return disable();
             }
         }
 
-        if (!ctrl_.isActive())
+        if (!ctrl_.isActive()) {
+            releaseLed();
             return disable();
+        }
         return static_cast<int32_t>(IDENTIFY_HALF_PERIOD_MS / 2);
     }
 
@@ -101,10 +107,13 @@ class IdentifyThread : private concurrency::OSThread
 #endif
     }
 
-    void restoreLed()
+    void releaseLed()
     {
+        // Drop ownership first so StatusLEDModule can write on its next tick.
+        ctrl_.stop();
 #ifdef LED_POWER
-        digitalWrite(LED_POWER, LED_STATE_ON);
+        // Do not force ON — baseline T1000-E heartbeat is mostly OFF.
+        digitalWrite(LED_POWER, LED_STATE_OFF);
 #endif
     }
 
