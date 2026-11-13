@@ -22,12 +22,15 @@ class BoardFinderModule : public SinglePortModule
     meshtastic_MeshPacket *allocReply() override;
 
   private:
+    // Persistent fields only. board_armed is runtime-only (never restored from flash).
     struct Prefs {
         bool ble_burst_enabled = false;
         boardfinder::DeviceRole device_role = boardfinder::DeviceRole::NORMAL;
         uint32_t rider_node_id = 0;
-        bool board_armed = false;
     };
+
+    // Runtime ARM mirror for CONFIG_RESPONSE; source of truth is BoardFinderEngine.
+    bool runtimeArmed = false;
 
     static concurrency::Lock &prefsLock();
     static bool loadPrefs(Prefs &out);

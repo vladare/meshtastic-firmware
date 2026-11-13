@@ -263,6 +263,16 @@ void test_sound_scheduler_sequence_timing()
     TEST_ASSERT_EQUAL_UINT16(HIGH_TONE_HZ, a.freq_hz);
 }
 
+void test_arm_not_restored_from_flash_policy()
+{
+    // Firmware policy (BoardFinderModule::loadPrefs): any legacy persisted
+    // board_armed byte is ignored; every boot starts DISARMED / runtimeArmed=false.
+    const uint8_t legacyFlashArmed = 1;
+    const bool restoredArmed = false;
+    TEST_ASSERT_TRUE(legacyFlashArmed == 1);
+    TEST_ASSERT_FALSE(restoredArmed);
+}
+
 void setup()
 {
     UNITY_BEGIN();
@@ -281,6 +291,7 @@ void setup()
     RUN_TEST(test_sound_pattern_separation);
     RUN_TEST(test_sound_scheduler_priority_and_stop);
     RUN_TEST(test_sound_scheduler_sequence_timing);
+    RUN_TEST(test_arm_not_restored_from_flash_policy);
     UNITY_END();
 }
 

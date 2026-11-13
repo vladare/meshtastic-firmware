@@ -32,7 +32,7 @@ struct PrefsRecord {
     uint32_t version;
     uint8_t ble_burst_enabled;
     uint8_t device_role;
-    uint8_t board_armed;
+    uint8_t board_armed_deprecated; // ignored at load; always written 0
     uint8_t reserved;
     uint32_t rider_node_id;
 };
@@ -52,10 +52,11 @@ concurrency::Lock &BoardFinderModule::prefsLock()
 BoardFinderModule::BoardFinderModule() : SinglePortModule("BoardFinder", meshtastic_PortNum_PRIVATE_APP)
 {
     loadPrefs(prefs);
+    runtimeArmed = false; // every boot starts DISARMED; ignore any legacy flash ARM flag
     boardFinderEngine = new BoardFinderEngine();
-    applyRuntime(true);
-    LOG_INFO("BoardFinder ready role=%u burst=%d armed=%d rider=0x%08x", static_cast<unsigned>(prefs.device_role),
-             prefs.ble_burst_enabled ? 1 : 0, prefs.board_armed ? 1 : 0, prefs.rider_node_id);
+    applyRuntime(false);
+    LOG_INFO("BoardFinder ready role=%u burst=%d armed=0 rider=0x%08x", static_cast<unsigned>(prefs.device_role),
+             prefs.ble_burst_enabled ? 1 : 0, prefs.rider_node_id);
 }
 
 bool BoardFinderModule::isLocalPhoneConfigRequest(const meshtastic_MeshPacket &mp)
@@ -98,7 +99,6 @@ bool BoardFinderModule::loadPrefs(Prefs &out)
         out.ble_burst_enabled = v1.ble_burst_enabled != 0;
         out.device_role = boardfinder::DeviceRole::NORMAL;
         out.rider_node_id = 0;
-        out.board_armed = false;
         LOG_INFO("BoardFinder migrated prefs v1->v2 burst=%d", out.ble_burst_enabled ? 1 : 0);
         return true;
     }
@@ -117,10 +117,9 @@ bool BoardFinderModule::loadPrefs(Prefs &out)
 
     out.ble_burst_enabled = rec.ble_burst_enabled != 0;
     out.device_role = static_cast<boardfinder::DeviceRole>(rec.device_role);
-    out.board_armed = rec.board_armed != 0;
     out.rider_node_id = rec.rider_node_id;
-    if (out.rider_node_id == 0)
-        out.board_armed = false;
+    // board_armed_deprecated intentionally ignored — ARM is runtime-only.
+    (void)rec.board_armed_deprecated;
     return true;
 #else
     (void)out;
@@ -142,7 +141,7 @@ bool BoardFinderModule::savePrefs(const Prefs &in)
     rec.version = kPrefsVersion;
     rec.ble_burst_enabled = in.ble_burst_enabled ? 1 : 0;
     rec.device_role = static_cast<uint8_t>(in.device_role);
-    rec.board_armed = in.board_armed ? 1 : 0;
+    rec.board_armed_deprecated = 0; // never persist ARM
     rec.rider_node_id = in.rider_node_id;
 
     SafeFile f(kPrefsPath, true);
@@ -160,7 +159,7 @@ bool BoardFinderModule::savePrefs(const Prefs &in)
 bool BoardFinderModule::persistIfChanged(const Prefs &next)
 {
     if (next.ble_burst_enabled == prefs.ble_burst_enabled && next.device_role == prefs.device_role &&
-        next.rider_node_id == prefs.rider_node_id && next.board_armed == prefs.board_armed) {
+        next.rider_node_id == prefs.rider_node_id) {
         return true;
     }
     if (!savePrefs(next))
@@ -176,7 +175,7 @@ void BoardFinderModule::applyRuntime(bool restartIfArmed)
     BoardFinderEngine::Config cfg{};
     cfg.role = prefs.device_role;
     cfg.rider_node_id = prefs.rider_node_id;
-    cfg.board_armed = prefs.board_armed;
+    cfg.board_armed = runtimeArmed;
     cfg.ble_burst_enabled = prefs.ble_burst_enabled;
     boardFinderEngine->applyConfig(cfg, restartIfArmed);
 }
@@ -204,7 +203,7 @@ void BoardFinderModule::replyConfig(uint32_t requestId)
     pendingReply.has_device_role = true;
     pendingReply.rider_node_id = prefs.rider_node_id;
     pendingReply.has_rider_node_id = true;
-    pendingReply.board_armed = prefs.board_armed;
+    pendingReply.board_armed = runtimeArmed;
     pendingReply.has_board_armed = true;
     pendingReply.status = boardfinder::Status::OK;
     pendingReply.error_code = boardfinder::ErrorCode::NONE;
@@ -307,6 +306,7 @@ ProcessMessage BoardFinderModule::handleReceived(const meshtastic_MeshPacket &mp
             break;
         }
         Prefs next = prefs;
+        bool disarmRuntime = false;
         if (req.has_ble_burst_enabled)
             next.ble_burst_enabled = req.ble_burst_enabled;
         if (req.has_device_role) {
@@ -316,20 +316,23 @@ ProcessMessage BoardFinderModule::handleReceived(const meshtastic_MeshPacket &mp
             }
             next.device_role = req.device_role;
             if (next.device_role != boardfinder::DeviceRole::BOARD)
-                next.board_armed = false;
+                disarmRuntime = true;
         }
         if (req.has_rider_node_id) {
-            if (prefs.board_armed && req.rider_node_id != prefs.rider_node_id) {
-                // Changing Rider while armed: force disarm then apply.
-                next.board_armed = false;
-            }
+            if (runtimeArmed && req.rider_node_id != prefs.rider_node_id)
+                disarmRuntime = true; // changing Rider while armed: stop monitoring
             next.rider_node_id = req.rider_node_id;
             if (next.rider_node_id == 0)
-                next.board_armed = false;
+                disarmRuntime = true;
         }
         if (!persistIfChanged(next)) {
             replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
             break;
+        }
+        if (disarmRuntime) {
+            runtimeArmed = false;
+            if (boardFinderEngine)
+                boardFinderEngine->disarm();
         }
         applyRuntime(true);
         replyConfig(req.request_id);
@@ -343,11 +346,14 @@ ProcessMessage BoardFinderModule::handleReceived(const meshtastic_MeshPacket &mp
         }
         Prefs next = prefs;
         next.device_role = req.device_role;
-        if (next.device_role != boardfinder::DeviceRole::BOARD)
-            next.board_armed = false;
         if (!persistIfChanged(next)) {
             replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
             break;
+        }
+        if (next.device_role != boardfinder::DeviceRole::BOARD) {
+            runtimeArmed = false;
+            if (boardFinderEngine)
+                boardFinderEngine->disarm();
         }
         applyRuntime(true);
         replyConfig(req.request_id);
@@ -360,14 +366,16 @@ ProcessMessage BoardFinderModule::handleReceived(const meshtastic_MeshPacket &mp
             break;
         }
         Prefs next = prefs;
-        if (prefs.board_armed && req.rider_node_id != prefs.rider_node_id)
-            next.board_armed = false;
+        const bool riderChangedWhileArmed = runtimeArmed && req.rider_node_id != prefs.rider_node_id;
         next.rider_node_id = req.rider_node_id;
-        if (next.rider_node_id == 0)
-            next.board_armed = false;
         if (!persistIfChanged(next)) {
             replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
             break;
+        }
+        if (riderChangedWhileArmed || next.rider_node_id == 0) {
+            runtimeArmed = false;
+            if (boardFinderEngine)
+                boardFinderEngine->disarm();
         }
         applyRuntime(true);
         replyConfig(req.request_id);
@@ -383,14 +391,11 @@ ProcessMessage BoardFinderModule::handleReceived(const meshtastic_MeshPacket &mp
             replyError(req.request_id, boardfinder::ErrorCode::RIDER_UNASSIGNED);
             break;
         }
-        Prefs next = prefs;
-        next.board_armed = true;
-        if (!persistIfChanged(next)) {
-            replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
-            break;
-        }
+        // Runtime-only: do not write ARM to flash.
+        runtimeArmed = true;
         auto err = boardFinderEngine ? boardFinderEngine->arm() : boardfinder::ErrorCode::INTERNAL;
         if (err != boardfinder::ErrorCode::NONE) {
+            runtimeArmed = false;
             replyError(req.request_id, err);
             break;
         }
@@ -399,12 +404,8 @@ ProcessMessage BoardFinderModule::handleReceived(const meshtastic_MeshPacket &mp
     }
 
     case boardfinder::Command::DISARM_BOARD: {
-        Prefs next = prefs;
-        next.board_armed = false;
-        if (!persistIfChanged(next)) {
-            replyError(req.request_id, boardfinder::ErrorCode::INTERNAL);
-            break;
-        }
+        // Runtime-only: do not write DISARM to flash.
+        runtimeArmed = false;
         if (boardFinderEngine)
             boardFinderEngine->disarm();
         replyBoardStatus(req.request_id);
