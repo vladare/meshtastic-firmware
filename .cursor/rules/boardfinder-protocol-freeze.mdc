@@ -1,0 +1,15 @@
+---
+description: Board Finder Protocol Freeze — version 1 only
+alwaysApply: true
+---
+
+# Board Finder Protocol Freeze
+
+The only authorized `protocol_version` is **1**.
+
+- Do not increment or negotiate protocol versions.
+- Do not introduce v2/v3 when adding functionality.
+- Preserve all existing command IDs, protobuf field numbers, wire types, and semantics.
+- Additive fields/commands may use unused numbers within version 1.
+- Any breaking protocol change requires explicit user approval before implementation.
+- Canonical contract: `protocol/boardfinder.proto` and `docs/PROTOCOL_FREEZE.md`.

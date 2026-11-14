@@ -7,15 +7,14 @@
 // Wire encoding is standard protobuf binary with the field numbers below.
 // Official Meshtastic Config/ModuleConfig/AdminMessage protos are not modified.
 //
-// v1 fields 1-6 and commands 0-4 remain stable for Rider advertising control.
-// v2 adds role/board commands and status fields; firmware accepts versions 1..3.
-// v3 adds GPS Economy Mode configuration and status fields (17-23).
+// FROZEN: protocol_version is always 1. Additive commands/fields may be added
+// with new unused numbers without changing protocol_version. See
+// protocol/boardfinder.proto and docs/PROTOCOL_FREEZE.md.
 
 namespace boardfinder
 {
 
-constexpr uint32_t PROTOCOL_VERSION = 3;
-constexpr uint32_t PROTOCOL_VERSION_MIN = 1;
+constexpr uint32_t PROTOCOL_VERSION = 1;
 constexpr size_t MAX_MESSAGE_BYTES = 192;
 
 enum class Command : uint8_t {

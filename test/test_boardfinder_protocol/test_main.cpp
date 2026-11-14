@@ -463,6 +463,26 @@ void test_economy_new_separation_restarts_normal()
     TEST_ASSERT_EQUAL_UINT32(0, sched.separationElapsedSeconds(5000 * 1000u));
 }
 
+void test_protocol_version_frozen_at_one()
+{
+    TEST_ASSERT_EQUAL_UINT32(1, PROTOCOL_VERSION);
+
+    Message req{};
+    req.protocol_version = PROTOCOL_VERSION;
+    req.request_id = 1;
+    req.command = Command::GET_CONFIG;
+    uint8_t buf[MAX_MESSAGE_BYTES];
+    size_t len = encodeMessage(req, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(len > 0);
+    Message out{};
+    TEST_ASSERT_TRUE(decodeMessage(buf, len, out));
+    TEST_ASSERT_EQUAL_UINT32(1, out.protocol_version);
+
+    // Unauthorized versions must not equal the frozen constant.
+    TEST_ASSERT_FALSE(2 == PROTOCOL_VERSION);
+    TEST_ASSERT_FALSE(3 == PROTOCOL_VERSION);
+}
+
 void test_encode_decode_economy_config()
 {
     Message req{};
@@ -552,6 +572,7 @@ void setup()
     RUN_TEST(test_identify_auto_stop_without_caller);
     RUN_TEST(test_identify_ownership_clears_on_stop);
     RUN_TEST(test_identify_alternating_phases);
+    RUN_TEST(test_protocol_version_frozen_at_one);
     RUN_TEST(test_economy_defaults_and_validation);
     RUN_TEST(test_economy_scheduler_phases);
     RUN_TEST(test_economy_no_duplicate_at_phase_transition);

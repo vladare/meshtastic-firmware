@@ -369,7 +369,7 @@ ProcessMessage BoardFinderModule::handleReceived(const meshtastic_MeshPacket &mp
         return ProcessMessage::STOP;
     }
 
-    if (req.protocol_version < boardfinder::PROTOCOL_VERSION_MIN || req.protocol_version > boardfinder::PROTOCOL_VERSION) {
+    if (req.protocol_version != boardfinder::PROTOCOL_VERSION) {
         replyError(req.request_id, boardfinder::ErrorCode::UNSUPPORTED_VERSION);
         deliverReply(mp);
         return ProcessMessage::STOP;

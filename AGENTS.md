@@ -2,6 +2,17 @@
 
 This repository is the [Meshtastic](https://meshtastic.org) firmware — a C++17 embedded codebase targeting ESP32 / nRF52 / RP2040 / STM32WL / Linux-Portduino LoRa mesh radios — plus a Python MCP server in `mcp-server/` that AI agents use to flash, configure, and test connected devices.
 
+## Board Finder Protocol Freeze
+
+The only authorized Board Finder `protocol_version` is **1**.
+
+- Do not increment or negotiate protocol versions.
+- Do not introduce v2/v3 when adding functionality.
+- Preserve all existing command IDs, protobuf field numbers, wire types, and semantics.
+- Additive fields/commands may use unused numbers within version 1.
+- Any breaking protocol change requires explicit user approval.
+- See `docs/PROTOCOL_FREEZE.md` and `protocol/boardfinder.proto`.
+
 ## Primary instruction file
 
 **Read `.github/copilot-instructions.md` first.** That file is the canonical agent-facing document for this repo. It covers project layout, coding conventions (naming, module framework, Observer pattern, thread safety), the build system, CI/CD, the native C++ test suite, and — most importantly for automation work — the **MCP Server & Hardware Test Harness** section. Read it top-to-bottom before starting any non-trivial change.

@@ -38,3 +38,13 @@ You are working inside the official Meshtastic firmware repository.
 
 - Change **only** the code needed for the current task.
 - Do not “clean up” or refactor unrelated modules unless explicitly requested.
+
+## Board Finder Protocol Freeze
+
+- The only authorized `protocol_version` is **1**.
+- Do **not** increment or negotiate protocol versions (no v2/v3/v4).
+- Do **not** introduce a new protocol version when adding functionality.
+- Preserve all existing command IDs, protobuf field numbers, wire types, and semantics.
+- Additive commands/fields may use previously unused numbers within version 1.
+- Any breaking protocol change requires **explicit user approval** before implementation.
+- Canonical contract: `protocol/boardfinder.proto` and `docs/PROTOCOL_FREEZE.md`.

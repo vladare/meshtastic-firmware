@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package boardfinder;
+
+// =============================================================================
+// Board Finder PRIVATE_APP protocol — FROZEN at protocol_version = 1
+// =============================================================================
+// Transport: Meshtastic Phone API → ToRadio/FromRadio → PortNum.PRIVATE_APP (256)
+// Local-only: request from==0, unicast to local node. Remote mesh control rejected.
+//
+// protocol_version MUST always be 1 on the wire.
+// Additive commands and fields may use previously unused numbers without bumping
+// protocol_version. Existing numbers, types, and semantics are immutable.
+// Canonical copy: keep identical in firmware and Android repositories.
+// See docs/PROTOCOL_FREEZE.md.
+// =============================================================================
+
+enum Command {
+  COMMAND_UNSPECIFIED = 0;
+  GET_CONFIG = 1;
+  SET_CONFIG = 2;
+  CONFIG_RESPONSE = 3;
+  ERROR_RESPONSE = 4;
+  SET_DEVICE_ROLE = 5;
+  SET_RIDER_NODE_ID = 6;
+  ARM_BOARD = 7;
+  DISARM_BOARD = 8;
+  GET_BOARD_STATUS = 9;
+  BOARD_STATUS_RESPONSE = 10;
+  IDENTIFY_DEVICE = 11;
+  IDENTIFY_RESPONSE = 12;
+}
+
+enum Status {
+  STATUS_OK = 0;
+  STATUS_ERROR = 1;
+}
+
+enum ErrorCode {
+  ERROR_NONE = 0;
+  UNSUPPORTED_VERSION = 1;
+  UNSUPPORTED_COMMAND = 2;
+  MALFORMED = 3;
+  NOT_LOCAL = 4;
+  INTERNAL = 5;
+  INVALID_ROLE = 6;
+  NOT_BOARD = 7;
+  RIDER_UNASSIGNED = 8;
+  INVALID_STATE = 9;
+  INVALID_CONFIG = 10;
+}
+
+enum DeviceRole {
+  ROLE_NORMAL = 0;
+  ROLE_RIDER = 1;
+  ROLE_BOARD = 2;
+}
+
+enum BoardState {
+  BOARD_DISARMED = 0;
+  BOARD_DISCOVERING = 1;
+  BOARD_SYNCHRONIZING = 2;
+  BOARD_MONITORING = 3;
+  BOARD_SEPARATED = 4;
+  BOARD_ERROR = 5;
+}
+
+enum GpsReportStatus {
+  GPS_NONE = 0;
+  GPS_OK = 1;
+  GPS_UNAVAILABLE = 2;
+  GPS_DEFERRED = 3;
+  GPS_FAILED = 4;
+}
+
+enum ReportingPhase {
+  REPORTING_INACTIVE = 0;
+  REPORTING_NORMAL = 1;
+  REPORTING_ECONOMY = 2;
+}
+
+// Presence: absent optional fields must not be treated as "reset to default"
+message Message {
+  uint32 protocol_version = 1; // MUST be 1
+  uint32 request_id = 2;
+  Command command = 3;
+
+  bool ble_burst_enabled = 4;
+  Status status = 5;
+  ErrorCode error_code = 6;
+
+  DeviceRole device_role = 7;
+  uint32 rider_node_id = 8;
+  bool board_armed = 9;
+  BoardState board_state = 10;
+  bool synchronized = 11;
+  uint32 consecutive_missed_bursts = 12;
+  sint32 last_rider_rssi = 13;
+  uint32 last_rider_seen_age_seconds = 14;
+  bool gps_tracking_active = 15;
+  GpsReportStatus last_gps_report_status = 16;
+
+  // Economy Mode (additive within protocol_version = 1)
+  bool economy_enabled = 17;
+  uint32 economy_after_seconds = 18;
+  uint32 normal_gps_interval_seconds = 19;
+  uint32 economy_gps_interval_seconds = 20;
+  ReportingPhase reporting_phase = 21;
+  uint32 separation_elapsed_seconds = 22;
+  uint32 next_gps_report_due_seconds = 23;
+}
