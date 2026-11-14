@@ -37,6 +37,8 @@ bool validateEconomySettings(const EconomySettings &s)
 
 void GpsReportScheduler::reset()
 {
+    // End the current separation cycle completely. Must not leave separatedAtMs_/phase_
+    // that could make a later cycle look already past the Economy threshold.
     active_ = false;
     phase_ = ReportingPhase::INACTIVE;
     separatedAtMs_ = 0;
@@ -46,10 +48,13 @@ void GpsReportScheduler::reset()
 
 void GpsReportScheduler::onEnterSeparated(uint32_t nowMs)
 {
+    // Always start a fresh cycle — even if previously active (defensive).
+    cycleId_++;
     active_ = true;
     separatedAtMs_ = nowMs;
     lastAttemptMs_ = 0;
     hasAttempt_ = false;
+    phase_ = ReportingPhase::NORMAL;
     refreshPhase(nowMs);
 }
 
@@ -65,11 +70,25 @@ void GpsReportScheduler::refreshPhase(uint32_t nowMs)
     phase_ = computePhase(active_, settings_, separatedAtMs_, nowMs);
 }
 
+ReportingPhase GpsReportScheduler::phaseAt(uint32_t nowMs) const
+{
+    return computePhase(active_, settings_, separatedAtMs_, nowMs);
+}
+
 uint32_t GpsReportScheduler::intervalSeconds() const
 {
     if (!active_)
         return 0;
     if (phase_ == ReportingPhase::ECONOMY)
+        return settings_.economy_gps_interval_seconds;
+    return settings_.normal_gps_interval_seconds;
+}
+
+uint32_t GpsReportScheduler::intervalSecondsAt(uint32_t nowMs) const
+{
+    if (!active_)
+        return 0;
+    if (phaseAt(nowMs) == ReportingPhase::ECONOMY)
         return settings_.economy_gps_interval_seconds;
     return settings_.normal_gps_interval_seconds;
 }
@@ -87,10 +106,7 @@ bool GpsReportScheduler::nextDueSeconds(uint32_t nowMs, uint32_t &dueSeconds) co
     if (!active_)
         return false;
 
-    const ReportingPhase ph = computePhase(active_, settings_, separatedAtMs_, nowMs);
-    const uint32_t intervalS =
-        (ph == ReportingPhase::ECONOMY) ? settings_.economy_gps_interval_seconds : settings_.normal_gps_interval_seconds;
-    const uint32_t intervalMs = intervalS * 1000u;
+    const uint32_t intervalMs = intervalSecondsAt(nowMs) * 1000u;
 
     if (!hasAttempt_) {
         dueSeconds = 0;
@@ -115,6 +131,8 @@ bool GpsReportScheduler::isDue(uint32_t nowMs) const
 
 void GpsReportScheduler::markAttempted(uint32_t nowMs)
 {
+    if (!active_)
+        return; // ignore stale callbacks after recovery/DISARM
     hasAttempt_ = true;
     lastAttemptMs_ = nowMs;
 }

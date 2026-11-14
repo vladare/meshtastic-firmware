@@ -7,7 +7,7 @@ namespace boardfinder
 {
 
 constexpr uint32_t DEFAULT_ECONOMY_AFTER_S = 3600;
-constexpr uint32_t DEFAULT_NORMAL_GPS_S = 60;
+constexpr uint32_t DEFAULT_NORMAL_GPS_S = 30;
 constexpr uint32_t DEFAULT_ECONOMY_GPS_S = 300;
 constexpr uint32_t MIN_ECONOMY_AFTER_S = 300;   // 5 minutes
 constexpr uint32_t MAX_ECONOMY_AFTER_S = 14400; // 240 minutes
@@ -29,7 +29,8 @@ EconomySettings defaultEconomySettings();
 
 /**
  * Pure GPS reporting phase scheduler for SEPARATED (unit-testable).
- * Does not touch flash or hardware; Engine owns GPS transmission.
+ * Each onEnterSeparated() starts an independent cycle; reset() ends it.
+ * Elapsed Economy time is measured from the current cycle start only.
  */
 class GpsReportScheduler
 {
@@ -39,9 +40,12 @@ class GpsReportScheduler
     void setSettings(const EconomySettings &s, uint32_t nowMs);
 
     bool active() const { return active_; }
+    uint32_t cycleId() const { return cycleId_; }
     ReportingPhase phase() const { return phase_; }
+    ReportingPhase phaseAt(uint32_t nowMs) const;
     EconomySettings settings() const { return settings_; }
     uint32_t intervalSeconds() const;
+    uint32_t intervalSecondsAt(uint32_t nowMs) const;
     uint32_t separationElapsedSeconds(uint32_t nowMs) const;
     // true when active; dueSeconds=0 means report is due now.
     bool nextDueSeconds(uint32_t nowMs, uint32_t &dueSeconds) const;
@@ -56,6 +60,7 @@ class GpsReportScheduler
     uint32_t separatedAtMs_ = 0;
     uint32_t lastAttemptMs_ = 0;
     bool hasAttempt_ = false;
+    uint32_t cycleId_ = 0;
 };
 
 } // namespace boardfinder

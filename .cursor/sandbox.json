@@ -1,0 +1,20 @@
+{
+  "type": "workspace_readwrite",
+  "additionalReadwritePaths": [
+    "C:\\Users\\NUC\\.cursor\\plans"
+  ],
+  "additionalReadonlyPaths": [
+    "C:\\Users\\NUC\\.gradle",
+    "C:\\Users\\NUC\\Projects\\Bridge-Launcher\\runtime\\node-v22.14.0-win-x64",
+    "C:\\Users\\NUC\\.cursor\\projects\\c-Users-NUC-Projects-meshtastic-firmware\\terminals",
+    "C:\\Users\\NUC\\.cursor\\projects\\c-Users-NUC-Projects-meshtastic-firmware\\agent-transcripts"
+  ],
+  "disableTmpWrite": true,
+  "networkPolicy": {
+    "default": "deny",
+    "allow": [],
+    "deny": [
+      "*"
+    ]
+  }
+}

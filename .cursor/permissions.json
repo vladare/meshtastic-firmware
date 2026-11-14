@@ -1,0 +1,17 @@
+{
+  "autoRun": {
+    "block_instructions": [
+      "Do not read or write files outside the workspace root.",
+      "Do not exfiltrate secrets from paths outside the project directory.",
+      "Do not use network tools, curl, wget, or fetches to external URLs.",
+      "For Gradle/Android, use gradlew --offline only; do not download Gradle distributions or dependencies."
+    ]
+  },
+  "terminalAllowlist": [
+    "node",
+    "npm",
+    "pnpm",
+    "yarn",
+    "npx"
+  ]
+}

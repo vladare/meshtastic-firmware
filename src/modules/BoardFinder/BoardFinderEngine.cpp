@@ -159,8 +159,7 @@ BoardFinderEngine::StatusSnapshot BoardFinderEngine::status() const
     s.gps_tracking_active = gpsTrackingActive;
     s.last_gps_report_status = lastGpsStatus;
     s.economy = cfg.economy;
-    s.reporting_phase = gpsScheduler.active() ? gpsScheduler.phase() : boardfinder::ReportingPhase::INACTIVE;
-    // Refresh phase for status without mutating: recompute via nextDue / elapsed.
+    s.reporting_phase = boardfinder::ReportingPhase::INACTIVE;
     if (gpsScheduler.active()) {
         s.has_separation_elapsed_seconds = true;
         s.separation_elapsed_seconds = gpsScheduler.separationElapsedSeconds(now);
@@ -169,14 +168,7 @@ BoardFinderEngine::StatusSnapshot BoardFinderEngine::status() const
             s.has_next_gps_report_due_seconds = true;
             s.next_gps_report_due_seconds = due;
         }
-        // Mirror live phase (economy threshold may have elapsed since last tick).
-        if (!cfg.economy.economy_enabled) {
-            s.reporting_phase = boardfinder::ReportingPhase::NORMAL;
-        } else if (s.separation_elapsed_seconds >= cfg.economy.economy_after_seconds) {
-            s.reporting_phase = boardfinder::ReportingPhase::ECONOMY;
-        } else {
-            s.reporting_phase = boardfinder::ReportingPhase::NORMAL;
-        }
+        s.reporting_phase = gpsScheduler.phaseAt(now);
     }
     return s;
 }
@@ -292,25 +284,30 @@ void BoardFinderEngine::enterSeparated()
 {
     transitionTo(boardfinder::BoardState::SEPARATED);
     boardfinder::playBoardFinderSound(boardfinder::BoardFinderSound::SEPARATION_DETECTED);
-    gpsTrackingActive = true;
     lastGpsStatus = boardfinder::GpsReportStatus::NONE;
+    // New independent tracking cycle: always NORMAL first, fresh Economy countdown.
     gpsScheduler.setSettings(cfg.economy, millis());
     gpsScheduler.onEnterSeparated(millis());
-    LOG_INFO("[BF] SEPARATED — GPS tracking on (economy_after=%us)", cfg.economy.economy_after_seconds);
+    gpsTrackingActive = true;
+    LOG_INFO("[BF] SEPARATED cycle=%u NORMAL interval=%us economy_after=%us", gpsScheduler.cycleId(),
+             cfg.economy.normal_gps_interval_seconds, cfg.economy.economy_after_seconds);
 }
 
 void BoardFinderEngine::recoverFromSeparated(uint32_t burstStartMs, int8_t rssi)
 {
     // Recovery rule: one valid distinct Rider burst matching configured Node ID.
+    const uint32_t endedCycle = gpsScheduler.cycleId();
+    const uint32_t endedElapsed = gpsScheduler.separationElapsedSeconds(millis());
     noteBurst(burstStartMs, rssi);
     consecutiveMissed = 0;
     phaseAnchorMs = burstStartMs;
-    stopGpsTracking();
+    stopGpsTracking(); // stops GPS reports + resets Economy timer / phase / deadlines
     synchronized = true;
     reacquireUntilMs = 0;
     transitionTo(boardfinder::BoardState::MONITORING);
     nextWindowOpenMs = burstStartMs + kBurstPeriodMs - kScanPreMs;
-    LOG_INFO("[BF] recovered to MONITORING");
+    LOG_INFO("[BF] recovered to MONITORING — GPS off, economy reset (ended cycle=%u elapsed=%us)", endedCycle,
+             endedElapsed);
 }
 
 void BoardFinderEngine::stopGpsTracking()
@@ -321,10 +318,17 @@ void BoardFinderEngine::stopGpsTracking()
 
 void BoardFinderEngine::maybeReportGps(uint32_t nowMs)
 {
-    if (!gpsTrackingActive)
+    if (!gpsTrackingActive || !gpsScheduler.active())
         return;
 
+    const boardfinder::ReportingPhase prevPhase = gpsScheduler.phase();
     gpsScheduler.refreshPhase(nowMs);
+    const boardfinder::ReportingPhase phase = gpsScheduler.phase();
+    if (prevPhase == boardfinder::ReportingPhase::NORMAL && phase == boardfinder::ReportingPhase::ECONOMY) {
+        LOG_INFO("[BF] Economy Mode activated cycle=%u interval=%us", gpsScheduler.cycleId(),
+                 gpsScheduler.intervalSecondsAt(nowMs));
+    }
+
     if (!gpsScheduler.isDue(nowMs))
         return;
 
@@ -340,15 +344,16 @@ void BoardFinderEngine::maybeReportGps(uint32_t nowMs)
     meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNode(nodeDB->getNodeNum()) : nullptr;
     if (!node || !nodeDB->hasValidPosition(node) || !nodeDB->hasLocalPositionSinceBoot()) {
         lastGpsStatus = boardfinder::GpsReportStatus::UNAVAILABLE;
-        LOG_INFO("[BF] GPS unavailable — skip Position (phase=%u)", static_cast<unsigned>(gpsScheduler.phase()));
+        LOG_INFO("[BF] GPS unavailable — skip Position (phase=%u)", static_cast<unsigned>(phase));
         return;
     }
 
     if (positionModule) {
         positionModule->sendOurPosition();
         lastGpsStatus = boardfinder::GpsReportStatus::OK;
-        LOG_INFO("[BF] Position report sent phase=%u interval=%us", static_cast<unsigned>(gpsScheduler.phase()),
-                 gpsScheduler.intervalSeconds());
+        LOG_INFO("[BF] Position report sent cycle=%u phase=%u interval=%us elapsed=%us", gpsScheduler.cycleId(),
+                 static_cast<unsigned>(phase), gpsScheduler.intervalSecondsAt(nowMs),
+                 gpsScheduler.separationElapsedSeconds(nowMs));
     } else {
         lastGpsStatus = boardfinder::GpsReportStatus::FAILED;
     }

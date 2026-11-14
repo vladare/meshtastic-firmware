@@ -387,6 +387,7 @@ void test_economy_defaults_and_validation()
     EconomySettings d = defaultEconomySettings();
     TEST_ASSERT_TRUE(d.economy_enabled);
     TEST_ASSERT_EQUAL_UINT32(DEFAULT_ECONOMY_AFTER_S, d.economy_after_seconds);
+    TEST_ASSERT_EQUAL_UINT32(30, DEFAULT_NORMAL_GPS_S);
     TEST_ASSERT_EQUAL_UINT32(DEFAULT_NORMAL_GPS_S, d.normal_gps_interval_seconds);
     TEST_ASSERT_EQUAL_UINT32(DEFAULT_ECONOMY_GPS_S, d.economy_gps_interval_seconds);
     TEST_ASSERT_TRUE(validateEconomySettings(d));
@@ -395,7 +396,7 @@ void test_economy_defaults_and_validation()
     bad.economy_after_seconds = 60; // below 5 min
     TEST_ASSERT_FALSE(validateEconomySettings(bad));
     bad = d;
-    bad.economy_gps_interval_seconds = 30; // below normal
+    bad.economy_gps_interval_seconds = 20; // below min and < normal
     TEST_ASSERT_FALSE(validateEconomySettings(bad));
     bad = d;
     bad.normal_gps_interval_seconds = 120;
@@ -411,16 +412,17 @@ void test_economy_scheduler_phases()
     sched.onEnterSeparated(0);
     TEST_ASSERT_TRUE(sched.active());
     TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phase()));
+    TEST_ASSERT_EQUAL_UINT32(DEFAULT_NORMAL_GPS_S, sched.intervalSecondsAt(0));
     TEST_ASSERT_TRUE(sched.isDue(0)); // first report immediate
     sched.markAttempted(0);
-    TEST_ASSERT_FALSE(sched.isDue(30000));
-    TEST_ASSERT_TRUE(sched.isDue(60000));
+    TEST_ASSERT_FALSE(sched.isDue(15 * 1000u));
+    TEST_ASSERT_TRUE(sched.isDue(30 * 1000u)); // Normal = 30s
 
     sched.refreshPhase(3599 * 1000u);
     TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phase()));
     sched.refreshPhase(3600 * 1000u);
     TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::ECONOMY), static_cast<int>(sched.phase()));
-    TEST_ASSERT_EQUAL_UINT32(DEFAULT_ECONOMY_GPS_S, sched.intervalSeconds());
+    TEST_ASSERT_EQUAL_UINT32(DEFAULT_ECONOMY_GPS_S, sched.intervalSecondsAt(3600 * 1000u));
 }
 
 void test_economy_no_duplicate_at_phase_transition()
@@ -444,6 +446,7 @@ void test_economy_recovery_and_disable()
     sched.reset();
     TEST_ASSERT_FALSE(sched.active());
     TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::INACTIVE), static_cast<int>(sched.phase()));
+    TEST_ASSERT_FALSE(sched.isDue(5000 * 1000u)); // no reports after reset
 
     sched.onEnterSeparated(10000);
     EconomySettings off = defaultEconomySettings();
@@ -461,6 +464,87 @@ void test_economy_new_separation_restarts_normal()
     sched.onEnterSeparated(5000 * 1000u); // new incident
     TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phase()));
     TEST_ASSERT_EQUAL_UINT32(0, sched.separationElapsedSeconds(5000 * 1000u));
+    TEST_ASSERT_EQUAL_UINT32(DEFAULT_NORMAL_GPS_S, sched.intervalSecondsAt(5000 * 1000u));
+}
+
+void test_economy_recovery_then_reseparation_starts_normal()
+{
+    // Primary regression: Economy → recover/reset → new SEPARATED must be NORMAL @ 30s,
+    // and must not enter Economy until another full 3600s of continuous separation.
+    GpsReportScheduler sched;
+    const uint32_t t0 = 100000;
+    sched.onEnterSeparated(t0);
+    sched.markAttempted(t0);
+    sched.refreshPhase(t0 + 4000 * 1000u);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::ECONOMY), static_cast<int>(sched.phaseAt(t0 + 4000 * 1000u)));
+    TEST_ASSERT_EQUAL_UINT32(DEFAULT_ECONOMY_GPS_S, sched.intervalSecondsAt(t0 + 4000 * 1000u));
+    const uint32_t cycle1 = sched.cycleId();
+
+    // Rider recovery
+    sched.reset();
+    TEST_ASSERT_FALSE(sched.active());
+    TEST_ASSERT_FALSE(sched.isDue(t0 + 4000 * 1000u + 1000u));
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::INACTIVE), static_cast<int>(sched.phase()));
+
+    // Second separation
+    const uint32_t t1 = t0 + 5000 * 1000u;
+    sched.onEnterSeparated(t1);
+    TEST_ASSERT_TRUE(sched.cycleId() != cycle1);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phaseAt(t1)));
+    TEST_ASSERT_EQUAL_UINT32(DEFAULT_NORMAL_GPS_S, sched.intervalSecondsAt(t1));
+    TEST_ASSERT_TRUE(sched.isDue(t1));
+    sched.markAttempted(t1);
+    TEST_ASSERT_FALSE(sched.isDue(t1 + 15 * 1000u));
+    TEST_ASSERT_TRUE(sched.isDue(t1 + 30 * 1000u));
+
+    // Still NORMAL just before threshold of THIS cycle
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL),
+                      static_cast<int>(sched.phaseAt(t1 + 3599 * 1000u)));
+    // Economy only after 3600s of the new cycle
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::ECONOMY),
+                      static_cast<int>(sched.phaseAt(t1 + 3600 * 1000u)));
+}
+
+void test_economy_multiple_cycles_independent()
+{
+    GpsReportScheduler sched;
+    uint32_t t = 0;
+    // Sep1 → Economy → Recovery
+    sched.onEnterSeparated(t);
+    sched.refreshPhase(t + 4000 * 1000u);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::ECONOMY), static_cast<int>(sched.phaseAt(t + 4000 * 1000u)));
+    sched.reset();
+    // Sep2 → Normal → Recovery (before Economy)
+    t = 10000 * 1000u;
+    sched.onEnterSeparated(t);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phaseAt(t + 600 * 1000u)));
+    sched.reset();
+    // Sep3 → Normal → Economy → Recovery
+    t = 20000 * 1000u;
+    sched.onEnterSeparated(t);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phaseAt(t + 100 * 1000u)));
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::ECONOMY), static_cast<int>(sched.phaseAt(t + 3600 * 1000u)));
+    sched.reset();
+    // Sep4 → Normal
+    t = 30000 * 1000u;
+    sched.onEnterSeparated(t);
+    TEST_ASSERT_EQUAL(static_cast<int>(ReportingPhase::NORMAL), static_cast<int>(sched.phaseAt(t)));
+    TEST_ASSERT_EQUAL_UINT32(DEFAULT_NORMAL_GPS_S, sched.intervalSecondsAt(t));
+}
+
+void test_economy_stale_mark_after_reset_ignored()
+{
+    GpsReportScheduler sched;
+    sched.onEnterSeparated(0);
+    sched.reset();
+    sched.markAttempted(5000); // must not resurrect the cycle
+    TEST_ASSERT_FALSE(sched.active());
+    TEST_ASSERT_FALSE(sched.isDue(5000));
+}
+
+void test_protocol_version_still_one()
+{
+    TEST_ASSERT_EQUAL_UINT32(1, PROTOCOL_VERSION);
 }
 
 void test_protocol_version_frozen_at_one()
@@ -578,6 +662,10 @@ void setup()
     RUN_TEST(test_economy_no_duplicate_at_phase_transition);
     RUN_TEST(test_economy_recovery_and_disable);
     RUN_TEST(test_economy_new_separation_restarts_normal);
+    RUN_TEST(test_economy_recovery_then_reseparation_starts_normal);
+    RUN_TEST(test_economy_multiple_cycles_independent);
+    RUN_TEST(test_economy_stale_mark_after_reset_ignored);
+    RUN_TEST(test_protocol_version_still_one);
     RUN_TEST(test_encode_decode_economy_config);
     RUN_TEST(test_encode_board_status_economy);
     UNITY_END();
