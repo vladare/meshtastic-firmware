@@ -143,6 +143,10 @@ struct Message {
 
     uint32_t next_gps_report_due_seconds = 0;
     bool has_next_gps_report_due_seconds = false;
+
+    // SOS transmission opt-in (field 24). Presence distinguishes unsupported vs confirmed OFF.
+    bool sos_transmission_enabled = false;
+    bool has_sos_transmission_enabled = false;
 };
 
 // Returns encoded length, or 0 on failure.

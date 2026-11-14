@@ -28,6 +28,7 @@ constexpr uint8_t TAG_ECONOMY_GPS_INTERVAL_SECONDS = 20;
 constexpr uint8_t TAG_REPORTING_PHASE = 21;
 constexpr uint8_t TAG_SEPARATION_ELAPSED_SECONDS = 22;
 constexpr uint8_t TAG_NEXT_GPS_REPORT_DUE_SECONDS = 23;
+constexpr uint8_t TAG_SOS_TRANSMISSION_ENABLED = 24;
 
 bool writeByte(uint8_t **pp, uint8_t *end, uint8_t v)
 {
@@ -84,7 +85,8 @@ bool readVarint(const uint8_t **pp, const uint8_t *end, uint32_t &out)
 
 bool wantsBleBurstField(const Message &msg)
 {
-    return msg.has_ble_burst_enabled || msg.command == Command::CONFIG_RESPONSE || msg.command == Command::SET_CONFIG ||
+    // SET_CONFIG is presence-based: do not invent ble_burst when only other fields are set.
+    return msg.has_ble_burst_enabled || msg.command == Command::CONFIG_RESPONSE ||
            msg.command == Command::BOARD_STATUS_RESPONSE;
 }
 
@@ -93,6 +95,12 @@ bool wantsEconomyConfigFields(const Message &msg)
     return msg.command == Command::CONFIG_RESPONSE || msg.command == Command::BOARD_STATUS_RESPONSE ||
            msg.has_economy_enabled || msg.has_economy_after_seconds || msg.has_normal_gps_interval_seconds ||
            msg.has_economy_gps_interval_seconds;
+}
+
+bool wantsSosTransmissionField(const Message &msg)
+{
+    // Always include on CONFIG_RESPONSE so Android can distinguish supported OFF from unsupported.
+    return msg.has_sos_transmission_enabled || msg.command == Command::CONFIG_RESPONSE;
 }
 
 } // namespace
@@ -195,6 +203,12 @@ size_t encodeMessage(const Message &msg, uint8_t *out, size_t outMax)
     }
     if (msg.has_next_gps_report_due_seconds) {
         if (!writeKeyVarint(&p, end, TAG_NEXT_GPS_REPORT_DUE_SECONDS, msg.next_gps_report_due_seconds))
+            return 0;
+    }
+
+    if (wantsSosTransmissionField(msg)) {
+        // Encode false explicitly — presence must not be dropped for disable.
+        if (!writeKeyVarint(&p, end, TAG_SOS_TRANSMISSION_ENABLED, msg.sos_transmission_enabled ? 1u : 0u))
             return 0;
     }
 
@@ -332,6 +346,10 @@ bool decodeMessage(const uint8_t *in, size_t inLen, Message &out)
         case TAG_NEXT_GPS_REPORT_DUE_SECONDS:
             out.next_gps_report_due_seconds = value;
             out.has_next_gps_report_due_seconds = true;
+            break;
+        case TAG_SOS_TRANSMISSION_ENABLED:
+            out.sos_transmission_enabled = value != 0;
+            out.has_sos_transmission_enabled = true;
             break;
         default:
             break;

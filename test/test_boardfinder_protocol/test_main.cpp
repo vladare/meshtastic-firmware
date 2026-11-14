@@ -1,6 +1,7 @@
 #include "modules/BoardFinder/boardfinder_adv.h"
 #include "modules/BoardFinder/boardfinder_economy.h"
 #include "modules/BoardFinder/boardfinder_identify.h"
+#include "modules/BoardFinder/boardfinder_prefs.h"
 #include "modules/BoardFinder/boardfinder_protocol.h"
 #include "modules/BoardFinder/boardfinder_sound.h"
 #include <cstring>
@@ -595,6 +596,131 @@ void test_encode_decode_economy_config()
     TEST_ASSERT_FALSE(out.has_ble_burst_enabled); // partial update must not invent burst fields
 }
 
+void test_sos_tx_default_disabled()
+{
+    PersistentPrefs p{};
+    TEST_ASSERT_FALSE(p.sos_transmission_enabled);
+    TEST_ASSERT_FALSE(isSosTransmissionAllowed(false, false));
+    TEST_ASSERT_FALSE(isSosTransmissionAllowed(true, false));
+    TEST_ASSERT_FALSE(isSosTransmissionAllowed(false, true));
+    TEST_ASSERT_TRUE(isSosTransmissionAllowed(true, true));
+}
+
+void test_sos_set_config_false_has_explicit_presence()
+{
+    Message req{};
+    req.protocol_version = PROTOCOL_VERSION;
+    req.request_id = 11;
+    req.command = Command::SET_CONFIG;
+    req.sos_transmission_enabled = false;
+    req.has_sos_transmission_enabled = true;
+
+    uint8_t buf[MAX_MESSAGE_BYTES];
+    size_t len = encodeMessage(req, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(len > 0);
+
+    // Field 24 key = (24<<3)|0 = 0xC0
+    bool sawField24 = false;
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (buf[i] == 0xC0) {
+            sawField24 = true;
+            TEST_ASSERT_EQUAL_UINT8(0, buf[i + 1]); // false encoded as 0
+            break;
+        }
+    }
+    TEST_ASSERT_TRUE(sawField24);
+
+    Message out{};
+    TEST_ASSERT_TRUE(decodeMessage(buf, len, out));
+    TEST_ASSERT_TRUE(out.has_sos_transmission_enabled);
+    TEST_ASSERT_FALSE(out.sos_transmission_enabled);
+    TEST_ASSERT_FALSE(out.has_ble_burst_enabled); // SOS-only SET must not invent burst
+}
+
+void test_sos_set_config_true_and_config_response()
+{
+    Message req{};
+    req.protocol_version = PROTOCOL_VERSION;
+    req.request_id = 12;
+    req.command = Command::SET_CONFIG;
+    req.sos_transmission_enabled = true;
+    req.has_sos_transmission_enabled = true;
+    uint8_t buf[MAX_MESSAGE_BYTES];
+    size_t len = encodeMessage(req, buf, sizeof(buf));
+    Message out{};
+    TEST_ASSERT_TRUE(decodeMessage(buf, len, out));
+    TEST_ASSERT_TRUE(out.has_sos_transmission_enabled);
+    TEST_ASSERT_TRUE(out.sos_transmission_enabled);
+
+    Message resp{};
+    resp.protocol_version = PROTOCOL_VERSION;
+    resp.request_id = 12;
+    resp.command = Command::CONFIG_RESPONSE;
+    resp.sos_transmission_enabled = false;
+    resp.has_sos_transmission_enabled = true;
+    resp.status = Status::OK;
+    len = encodeMessage(resp, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(decodeMessage(buf, len, out));
+    TEST_ASSERT_TRUE(out.has_sos_transmission_enabled);
+    TEST_ASSERT_FALSE(out.sos_transmission_enabled);
+}
+
+void test_prefs_v3_to_v4_migration_defaults_sos_off()
+{
+    PrefsRecordV3 v3{};
+    v3.magic = PREFS_MAGIC;
+    v3.version = PREFS_VERSION_V3;
+    v3.ble_burst_enabled = 1;
+    v3.device_role = static_cast<uint8_t>(DeviceRole::BOARD);
+    v3.board_armed_deprecated = 1;
+    v3.economy_enabled = 1;
+    v3.rider_node_id = 0xAABBCCDDu;
+    v3.economy_after_seconds = DEFAULT_ECONOMY_AFTER_S;
+    v3.normal_gps_interval_seconds = DEFAULT_NORMAL_GPS_S;
+    v3.economy_gps_interval_seconds = DEFAULT_ECONOMY_GPS_S;
+
+    PersistentPrefs out{};
+    TEST_ASSERT_TRUE(parsePersistentPrefs(reinterpret_cast<const uint8_t *>(&v3), sizeof(v3), out));
+    TEST_ASSERT_TRUE(out.ble_burst_enabled);
+    TEST_ASSERT_EQUAL(static_cast<int>(DeviceRole::BOARD), static_cast<int>(out.device_role));
+    TEST_ASSERT_EQUAL_UINT32(0xAABBCCDDu, out.rider_node_id);
+    TEST_ASSERT_TRUE(out.economy.economy_enabled);
+    TEST_ASSERT_FALSE(out.sos_transmission_enabled); // migrated default OFF
+}
+
+void test_prefs_v4_roundtrip_sos_true_and_false()
+{
+    PersistentPrefs in{};
+    in.ble_burst_enabled = true;
+    in.device_role = DeviceRole::RIDER;
+    in.rider_node_id = 0x12345678u;
+    in.economy = defaultEconomySettings();
+    in.sos_transmission_enabled = true;
+
+    uint8_t buf[sizeof(PrefsRecordV4)] = {};
+    size_t n = encodePersistentPrefs(in, buf, sizeof(buf));
+    TEST_ASSERT_EQUAL(sizeof(PrefsRecordV4), n);
+
+    PersistentPrefs out{};
+    TEST_ASSERT_TRUE(parsePersistentPrefs(buf, n, out));
+    TEST_ASSERT_TRUE(out.sos_transmission_enabled);
+    TEST_ASSERT_EQUAL(static_cast<int>(DeviceRole::RIDER), static_cast<int>(out.device_role));
+    TEST_ASSERT_EQUAL_UINT32(0x12345678u, out.rider_node_id);
+
+    in.sos_transmission_enabled = false;
+    n = encodePersistentPrefs(in, buf, sizeof(buf));
+    TEST_ASSERT_TRUE(parsePersistentPrefs(buf, n, out));
+    TEST_ASSERT_FALSE(out.sos_transmission_enabled);
+}
+
+void test_prefs_fresh_defaults_sos_off()
+{
+    PersistentPrefs out{};
+    TEST_ASSERT_TRUE(parsePersistentPrefs(nullptr, 0, out));
+    TEST_ASSERT_FALSE(out.sos_transmission_enabled);
+    TEST_ASSERT_EQUAL(static_cast<int>(DeviceRole::NORMAL), static_cast<int>(out.device_role));
+}
+
 void test_encode_board_status_economy()
 {
     Message st{};
@@ -668,6 +794,12 @@ void setup()
     RUN_TEST(test_protocol_version_still_one);
     RUN_TEST(test_encode_decode_economy_config);
     RUN_TEST(test_encode_board_status_economy);
+    RUN_TEST(test_sos_tx_default_disabled);
+    RUN_TEST(test_sos_set_config_false_has_explicit_presence);
+    RUN_TEST(test_sos_set_config_true_and_config_response);
+    RUN_TEST(test_prefs_v3_to_v4_migration_defaults_sos_off);
+    RUN_TEST(test_prefs_v4_roundtrip_sos_true_and_false);
+    RUN_TEST(test_prefs_fresh_defaults_sos_off);
     UNITY_END();
 }
 

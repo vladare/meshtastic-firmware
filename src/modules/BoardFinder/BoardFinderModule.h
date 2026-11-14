@@ -5,6 +5,7 @@
 #include "BoardFinderEngine.h"
 #include "SinglePortModule.h"
 #include "boardfinder_economy.h"
+#include "boardfinder_prefs.h"
 #include "boardfinder_protocol.h"
 #include "concurrency/Lock.h"
 #include "mesh/MeshTypes.h"
@@ -18,18 +19,16 @@ class BoardFinderModule : public SinglePortModule
   public:
     BoardFinderModule();
 
+    /** Authoritative in-memory SOS TX flag (default false). No flash I/O. */
+    bool isSosTransmissionEnabled() const { return prefs.sos_transmission_enabled; }
+
   protected:
     ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
     meshtastic_MeshPacket *allocReply() override;
 
   private:
     // Persistent fields only. board_armed is runtime-only (never restored from flash).
-    struct Prefs {
-        bool ble_burst_enabled = false;
-        boardfinder::DeviceRole device_role = boardfinder::DeviceRole::NORMAL;
-        uint32_t rider_node_id = 0;
-        boardfinder::EconomySettings economy = boardfinder::defaultEconomySettings();
-    };
+    using Prefs = boardfinder::PersistentPrefs;
 
     // Runtime ARM mirror for CONFIG_RESPONSE; source of truth is BoardFinderEngine.
     bool runtimeArmed = false;

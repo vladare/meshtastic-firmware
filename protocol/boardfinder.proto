@@ -108,4 +108,8 @@ message Message {
   ReportingPhase reporting_phase = 21;
   uint32 separation_elapsed_seconds = 22;
   uint32 next_gps_report_due_seconds = 23;
+
+  // SOS transmission opt-in (additive within protocol_version = 1)
+  // Presence required: false must be encoded explicitly to disable.
+  bool sos_transmission_enabled = 24;
 }

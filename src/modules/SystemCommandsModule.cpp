@@ -18,6 +18,9 @@
 #include "mesh/generated/meshtastic/portnums.pb.h"
 #include "modules/AdminModule.h"
 #include "modules/ExternalNotificationModule.h"
+#if defined(TRACKER_T1000_E)
+#include "modules/BoardFinder/BoardFinderModule.h"
+#endif
 
 SystemCommandsModule *systemCommandsModule;
 
@@ -132,6 +135,16 @@ int SystemCommandsModule::handleInputEvent(const InputEvent *event)
 
     // SOS (T1000-E and any board that maps long-press to INPUT_BROKER_SOS)
     case INPUT_BROKER_SOS: {
+#if defined(TRACKER_T1000_E)
+        // Opt-in: default OFF. Gate before any packet or sender ACK state.
+        // Absent module → disabled (safe default before/without prefs init).
+        const bool allowed = boardfinder::isSosTransmissionAllowed(
+            boardFinderModule != nullptr, boardFinderModule && boardFinderModule->isSosTransmissionEnabled());
+        if (!allowed) {
+            LOG_INFO("SOS transmission disabled; ignoring trigger");
+            return true;
+        }
+#endif
         meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeDB->getNodeNum());
 
         // 1) Keep existing ALERT_APP send (popup + alarm)
